@@ -21,9 +21,11 @@ class RWMState(NamedTuple):
 
 def standard_normal_log_prob(x: Array) -> Array:
     """log N(0, I) for x with shape (..., D). Returns shape (...,)."""
+    x = jnp.asarray(x) 
     D = x.shape[-1]
-    # -0.5 * (||x||^2 + D * log(2π))
-    return -0.5 * (jnp.sum(x**2, axis=-1) + D * jnp.log(2.0 * jnp.pi))
+    two_pi = jnp.array(2.0 * jnp.pi, dtype=x.dtype) 
+    half   = jnp.array(0.5, dtype=x.dtype)
+    return -half * (jnp.sum(x**2, axis=-1) + D * jnp.log(two_pi)) 
 
 
 def _ensure_batched(x: Array) -> Tuple[Array, bool]:
@@ -47,7 +49,7 @@ def rwMH_init(logprob_fn: LogProbFn, init_position: Array) -> RWMState:
     Ensures batching and computes initial log probabilities.
     """
     pos, _ = _ensure_batched(init_position)
-    log_prob = vmap(logprob_fn)(pos)
+    log_prob = vmap(logprob_fn)(pos).astype(pos.dtype)
     return RWMState(position=pos, 
                     log_prob=log_prob, 
                     accept_count=jnp.zeros(pos.shape[0], dtype=jnp.int32))
@@ -64,14 +66,17 @@ def rwMH_step(key: Array, state: RWMState, logprob_fn: LogProbFn, scale: Array) 
     #   - Uniform(0,1) for the accept/reject test
     next_key, k_noise, k_u = random.split(key, 3)
 
+    pos_dtype = state.position.dtype 
+    sc = jnp.asarray(scale, dtype=pos_dtype) 
     # random noise for each chain -> shape (n_chains, D)
-    eps = random.normal(k_noise, shape=(n_chains, D))
+    eps = random.normal(k_noise, shape=(n_chains, D), dtype=pos_dtype)
 
     #  broadcast multiply to (n_chains, D).
-    proposal = state.position + scale * eps
+    proposal = (state.position + sc * eps).astype(pos_dtype)
 
     # logprob for proposals
-    new_lp = vmap(logprob_fn)(proposal)   # shape (n_chains,)
+    logprob_dtype = state.log_prob.dtype
+    new_lp = vmap(logprob_fn)(proposal).astype(logprob_dtype)   # shape (n_chains,)
     # vmap(logprob_fn) lifts logprob_fn to batch over the first axis, calling
     # it once per chain and stacking the results.
 
@@ -79,14 +84,16 @@ def rwMH_step(key: Array, state: RWMState, logprob_fn: LogProbFn, scale: Array) 
     log_alpha = new_lp - state.log_prob   # shape (n_chains,)
 
     # Accept/reject per chain (in parallel)
-    u = random.uniform(k_u, shape=(n_chains,))
+    u = random.uniform(k_u, shape=(n_chains,), dtype=state.log_prob.dtype)
     # Accept if log(u) < min(0, log_alpha)
-    accept = jnp.log(u) < jnp.minimum(0.0, log_alpha)   # bool array, (n_chains,)
+    zero = jnp.array(0, dtype=state.log_prob.dtype)
+    accept = jnp.log(u) < jnp.minimum(zero, log_alpha)   # bool array, (n_chains,)
 
     # JAX functional updates (no in-place mutations)
-    new_pos = jnp.where(accept[:, None], proposal, state.position)
-    new_lp2 = jnp.where(accept, new_lp, state.log_prob)
-    new_accept_count = state.accept_count + accept.astype(jnp.int32)
+    new_pos = jnp.where(accept[:, None], proposal, state.position).astype(pos_dtype)
+    new_lp2 = jnp.where(accept, new_lp, state.log_prob).astype(logprob_dtype)
+    acc_dtype = state.accept_count.dtype
+    new_accept_count = (state.accept_count + accept.astype(acc_dtype)).astype(acc_dtype)
 
     return next_key, RWMState(new_pos, new_lp2, new_accept_count)
 
@@ -98,7 +105,7 @@ def rwMH_run(key: Array, logprob_fn: LogProbFn, init_position: Array,
     state = rwMH_init(logprob_fn, init_position)
     n_chains, D = state.position.shape
 
-    scale_arr = jnp.asarray(scale) # to avoid retracing
+    scale_arr = jnp.asarray(scale, dtype=state.position.dtype) # to avoid retracing
 
     if burn_in > 0:
         def burn_body(carry, _):
@@ -115,8 +122,8 @@ def rwMH_run(key: Array, logprob_fn: LogProbFn, init_position: Array,
         )
 
     # Pre-allocate arrays to accumulate samples and log probs
-    samples = jnp.zeros((num_samples, n_chains, D))
-    lps     = jnp.zeros((num_samples, n_chains))
+    samples = jnp.zeros((num_samples, n_chains, D), dtype=state.position.dtype)
+    lps     = jnp.zeros((num_samples, n_chains), dtype=state.position.dtype)
 
     def step(carry, t):
         key, state, samples, lps = carry
@@ -145,7 +152,7 @@ def run_sweep(key: Array, dims: list[int], scales: list[float],
         if init_strategy == "zeros":
             init = jnp.zeros((n_chains, D))
         elif init_strategy == "overdispersed":
-            subkey, key = random.split(key)
+            subkey, key = random.split(key) 
             init = random.normal(subkey, (n_chains, D)) * 3.0
         else:
             raise ValueError("Unknown init_strategy")

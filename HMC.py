@@ -38,9 +38,13 @@ def _ensure_batched(x: Array) -> Tuple[Array, bool]:
 
 def standard_normal_log_prob(x: Array) -> Array:
     """log N(0, I) for x with shape (..., D). Returns shape (...,)."""
+    x = jnp.asarray(x)
     D = x.shape[-1]
+    dtype = x.dtype
+    two_pi = jnp.array(2.0 * jnp.pi, dtype=dtype)
+    half = jnp.array(0.5, dtype=dtype)
     # -0.5 * (||x||^2 + D * log(2π))
-    return -0.5 * (jnp.sum(x**2, axis=-1) + D * jnp.log(2.0 * jnp.pi))
+    return -half * (jnp.sum(x**2, axis=-1) + D * jnp.log(two_pi))
 
 
 
@@ -50,6 +54,8 @@ def hmc_init(init_position: Array, log_prob_fn: LogProbFn) -> HMCState:
     n_chains = pos.shape[0]
     
     log_prob, grad_log_prob = vmap(jax.value_and_grad(log_prob_fn))(pos)
+    log_prob = log_prob.astype(pos.dtype)
+    grad_log_prob = grad_log_prob.astype(pos.dtype)
     
     return HMCState(
         position=pos,
@@ -62,20 +68,24 @@ def hmc_init(init_position: Array, log_prob_fn: LogProbFn) -> HMCState:
 @partial(jit, static_argnames=("num_steps", "log_prob_fn"))
 def leapfrog(position: Array, momentum: Array, step_size: float, lp: Array, grad_lp: Array, log_prob_fn: LogProbFn, num_steps: int) -> Tuple[Array, Array, Array, Array]:
     """ Perform num_steps of leapfrog integration. """
-    def step(carry, t):
-        position, momentum, lp, grad_lp = carry
-        momentum = momentum + 0.5 * step_size * grad_lp
-        position = position + step_size * momentum
-        new_lp, new_grad_lp = vmap(jax.value_and_grad(log_prob_fn))(position)
-        # new_grad_lp = vmap(jax.grad(log_prob_fn))(position)
-        momentum = momentum + 0.5 * step_size * new_grad_lp
-        return (position, momentum, new_lp, new_grad_lp), None
-    
-    (final_position, final_momentum, final_lp, final_grad_lp), _ = lax.scan(step, (position, momentum, lp, grad_lp), jnp.arange(num_steps))
+    pos_dtype = position.dtype
+    lp_dtype = lp.dtype
+    step_sz = jnp.asarray(step_size, dtype=pos_dtype)
+    half = jnp.array(0.5, dtype=pos_dtype)
 
-    # final_lp, _ = vmap(jax.value_and_grad(log_prob_fn))(final_position)
-    # final_lp = vmap(log_prob_fn)(final_position)
-    return final_position, final_momentum, final_grad_lp, final_lp
+    def lf_step(carry, t):
+        position, momentum, lp, grad_lp = carry
+        momentum = momentum + half * step_sz * grad_lp
+        position = position + step_sz * momentum
+        new_lp, new_grad_lp = vmap(jax.value_and_grad(log_prob_fn))(position)
+        new_lp = new_lp.astype(lp_dtype)
+        new_grad_lp = new_grad_lp.astype(pos_dtype)
+        momentum = momentum + half * step_sz * new_grad_lp
+        return (position.astype(pos_dtype), momentum.astype(pos_dtype), new_lp, new_grad_lp), None
+    
+    (final_position, final_momentum, final_lp, final_grad_lp), _ = lax.scan(lf_step, (position, momentum, lp, grad_lp), jnp.arange(num_steps))
+
+    return final_position.astype(pos_dtype), final_momentum.astype(pos_dtype), final_grad_lp.astype(pos_dtype), final_lp.astype(lp_dtype)
 
 
 @partial(jit, static_argnames=("num_steps", "log_prob_fn"))
@@ -84,35 +94,45 @@ def hmc_step(state: HMCState, step_size: float, num_steps: int, key: Array, log_
     n_chains, n_dim = state.position.shape
     next_key, k_momentum, k_accept = random.split(key, 3)
 
-    momentum = random.normal(k_momentum, shape=(n_chains, n_dim))
+    pos_dtype = state.position.dtype
+    logprob_dtype = state.log_prob.dtype
 
-    kinetic_initial = 0.5 * jnp.sum(momentum**2, axis=-1)
+    momentum = random.normal(k_momentum, shape=(n_chains, n_dim), dtype=pos_dtype)
+    step_size_arr = jnp.asarray(step_size, dtype=pos_dtype)
+    half = jnp.array(0.5, dtype=pos_dtype)
+
+    kinetic_initial = half * jnp.sum(momentum**2, axis=-1)
     hamiltonian_initial = -state.log_prob + kinetic_initial
 
     current_position = state.position
     grad_lp = state.grad_log_prob
     log_prob = state.log_prob
 
-    # for _ in range(num_steps):
-    #     current_position, momentum, grad_lp, log_prob = leapfrog(current_position, momentum, step_size, grad_lp, log_prob_fn)
-    # 
-    # JIT has to compile num_steps copies of the same operations for the for loop 
-    # because it unrolls into a huge computation graph that is linear in num_steps.
-    current_position, momentum, grad_lp, log_prob = leapfrog(current_position, momentum, step_size, log_prob, grad_lp, log_prob_fn=log_prob_fn, num_steps=num_steps)
+    current_position, momentum, grad_lp, log_prob = leapfrog(
+        current_position,
+        momentum,
+        step_size_arr,
+        log_prob,
+        grad_lp,
+        log_prob_fn=log_prob_fn,
+        num_steps=num_steps,
+    )
 
     momentum = -momentum 
 
-    kinetic_final = 0.5 * jnp.sum(momentum**2, axis=-1)
+    kinetic_final = half * jnp.sum(momentum**2, axis=-1)
     hamiltonian_final = -log_prob + kinetic_final
 
     log_alpha = hamiltonian_initial - hamiltonian_final
-    u = random.uniform(k_accept, shape=(n_chains,))
-    accept = jnp.log(u) < jnp.minimum(0.0, log_alpha)
+    u = random.uniform(k_accept, shape=(n_chains,), dtype=logprob_dtype)
+    zero = jnp.array(0.0, dtype=logprob_dtype)
+    accept = jnp.log(u) < jnp.minimum(zero, log_alpha)
 
     new_position = jnp.where(accept[:, None], current_position, state.position)
     new_log_prob = jnp.where(accept, log_prob, state.log_prob)
     new_grad_log_prob = jnp.where(accept[:, None], grad_lp, state.grad_log_prob)
-    new_accept_count = state.accept_count + accept.astype(jnp.int32)
+    acc_dtype = state.accept_count.dtype
+    new_accept_count = state.accept_count + accept.astype(acc_dtype)
 
     return next_key, HMCState(new_position, new_log_prob, new_grad_log_prob, new_accept_count)
 
@@ -122,11 +142,13 @@ def hmc_run(key: Array, log_prob_fn: LogProbFn, init_position: Array, step_size:
 
     init_state = hmc_init(init_position, log_prob_fn)
     n_chains, n_dim = init_state.position.shape
+    state = init_state
+    step_size_arr = jnp.asarray(step_size, dtype=init_state.position.dtype)
     
     if burn_in > 0:
         def burnin_step(carry, t):
             key, state = carry
-            key, new_state = hmc_step(state, step_size, num_steps, key, log_prob_fn)
+            key, new_state = hmc_step(state, step_size_arr, num_steps, key, log_prob_fn)
             return (key, new_state), None
         
         # key_burnin, key_sampling = random.split(key)
@@ -139,14 +161,16 @@ def hmc_run(key: Array, log_prob_fn: LogProbFn, init_position: Array, step_size:
             accept_count=jnp.zeros(n_chains, dtype=jnp.int32)
         )
         # key = key_sampling
+    else:
+        state = init_state
     
     # post burn-in
-    samples = jnp.zeros((num_samples, n_chains, n_dim))
-    lps = jnp.zeros((num_samples, n_chains))
+    samples = jnp.zeros((num_samples, n_chains, n_dim), dtype=state.position.dtype)
+    lps = jnp.zeros((num_samples, n_chains), dtype=state.log_prob.dtype)
 
     def step(carry, t):
         key, state, samples, lps = carry
-        key, new_state = hmc_step(state, step_size, num_steps, key, log_prob_fn)
+        key, new_state = hmc_step(state, step_size_arr, num_steps, key, log_prob_fn)
         samples = samples.at[t].set(new_state.position)
         lps = lps.at[t].set(new_state.log_prob)
         return (key, new_state, samples, lps), None
@@ -154,7 +178,7 @@ def hmc_run(key: Array, log_prob_fn: LogProbFn, init_position: Array, step_size:
     (key, final_state, samples, lps), _ = lax.scan(step, (key, state, samples, lps), jnp.arange(num_samples))
 
     accept_rate = final_state.accept_count.astype(jnp.float32) / num_samples
-    return samples, lps, final_state, accept_rate
+    return samples, lps, accept_rate, final_state
 
 
 
@@ -205,4 +229,3 @@ if __name__ == "__main__":
 
     az.plot_autocorr(idata, var_names=["x"], coords={"x_dim": slice(0, 3)})
     plt.show()
-
