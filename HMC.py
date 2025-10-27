@@ -20,7 +20,6 @@ class HMCState(NamedTuple):
     grad_log_prob: Array   # (n_chains, n_dim)
     accept_count: Array    # (n_chains,)
 
-
 def _ensure_batched(x: Array) -> Tuple[Array, bool]:
     """
     Guarantees consistent shape (n_chains, n_dim) so that vectorized operations work seamlessly.
