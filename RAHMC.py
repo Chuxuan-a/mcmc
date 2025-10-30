@@ -15,10 +15,14 @@ LogProbFn = Callable[[Array], Array]  # x -> log p(x)
 
 
 class RAHMCState(NamedTuple):
-    position: Array        # (n_chains, n_dim)
-    log_prob: Array        # (n_chains,)
-    grad_log_prob: Array   # (n_chains, n_dim)
-    accept_count: Array    # (n_chains,)
+    position: Array        # float32: (n_chains, n_dim)
+    log_prob: Array        # float64: (n_chains,)
+    grad_log_prob: Array   # float32: (n_chains, n_dim)
+    accept_count: Array    # int32: (n_chains,)
+
+# Energy calculations involve subtracting large numbers to get small differences, and in 
+# high dimensions, errors accumulates. In MCMC, acceptance probability depends on these 
+# tiny differences, so we use higher precision (float64) for log_prob to improve stability.
 
 
 def _ensure_batched(x: Array) -> Tuple[Array, bool]:
@@ -41,9 +45,10 @@ def standard_normal_log_prob(x: Array) -> Array:
 def rahmc_init(init_position: Array, log_prob_fn: LogProbFn) -> RAHMCState:
     pos, _ = _ensure_batched(init_position)
     n_chains = pos.shape[0]
+    pos_dtype = pos.dtype
     log_prob, grad_log_prob = vmap(jax.value_and_grad(log_prob_fn))(pos)
-    log_prob = log_prob.astype(pos.dtype)
-    grad_log_prob = grad_log_prob.astype(pos.dtype)
+    log_prob = log_prob.astype(jnp.float64) # higher precision for log_prob for stability
+    grad_log_prob = grad_log_prob.astype(pos_dtype)
     return RAHMCState(
         position=pos,
         log_prob=log_prob,
@@ -62,34 +67,30 @@ def _conformal_leapfrog_step(
     grad_log_prob: Array,
     log_prob_fn: LogProbFn,
 ):
-    """
-    One conformal-leapfrog step:
-      p <- e^{-gamma*eps/2} [p - (eps/2) * gradU(q)]
-      q <- q + eps * p
-      p <- e^{-gamma*eps/2} [p - (eps/2) * gradU(q_new)]
-    gradU = -grad_log_prob, pass grad_log_prob to avoid recompute.
-    """
     pos_dtype = position.dtype
     lp_dtype = log_prob.dtype
     eps = jnp.asarray(step_size, dtype=pos_dtype)
-    g = jnp.asarray(gamma, dtype=pos_dtype)
+    gam = jnp.asarray(gamma, dtype=pos_dtype)
 
-    # use gradU = -grad_log_prob
     half_eps = jnp.array(0.5, dtype=pos_dtype) * eps
-    scale = jnp.exp(-g * eps * jnp.array(0.5, dtype=pos_dtype))
+    scale = jnp.exp(-gam * half_eps)
 
-    # first half kick + friction scaling
-    momentum = (momentum - half_eps * (-grad_log_prob)) * scale
+    # apply friction scaling
+    momentum = momentum * scale
+    # half kick  
+    momentum = momentum + half_eps * grad_log_prob
     # drift
     position = position + eps * momentum
     # refresh grads
     new_lp, new_grad_lp = vmap(jax.value_and_grad(log_prob_fn))(position)
     new_lp = new_lp.astype(lp_dtype)
     new_grad_lp = new_grad_lp.astype(pos_dtype)
-    # second half kick + friction scaling
-    momentum = (momentum - half_eps * (-new_grad_lp)) * scale
+    # half kick
+    momentum = momentum + half_eps * new_grad_lp
+    # apply friction scaling
+    momentum = momentum * scale
 
-    return position.astype(pos_dtype), momentum.astype(pos_dtype), new_lp, new_grad_lp
+    return position, momentum, new_lp, new_grad_lp
 
 
 # Half-trajectory scan (repelling or attracting)
@@ -112,7 +113,7 @@ def _half_trajectory(
         return (q, p, lp, glp), None
 
     (q, p, lp, glp), _ = lax.scan(
-        body, (position, momentum, log_prob, grad_log_prob), jnp.arange(num_steps)
+        body, (position, momentum, log_prob, grad_log_prob), length=num_steps
     )
     return q, p, lp, glp
 
@@ -135,19 +136,24 @@ def rahmc_step(
       - MH accept/reject (Jacobian=1)
     """
     n_chains, n_dim = state.position.shape
-    next_key, k_mom, k_acc = random.split(key, 3)
     pos_dtype = state.position.dtype
     logprob_dtype = state.log_prob.dtype
+
+    # next_key, k_mom, k_acc = random.split(key, 3)
+    key, step_key = random.split(key)
+    k_mom, k_acc = random.split(step_key, 2)
 
     p0 = random.normal(k_mom, shape=(n_chains, n_dim), dtype=pos_dtype)
 
     # initial energies
-    half = jnp.array(0.5, dtype=pos_dtype)
-    kin0 = half * jnp.sum(p0**2, axis=-1)
-    H0 = -state.log_prob + kin0
+    # half = jnp.array(0.5, dtype=pos_dtype)
+    kin0 = 0.5 * jnp.sum(p0**2, axis=-1) # JAX will broadcast to the right type
+    # H0 = -state.log_prob + kin0    mixed dtypes!
+    # state.log_prob: float64, kin0: pos_dtype (float32)
+    H0 = -state.log_prob + kin0.astype(logprob_dtype)
 
     L1 = num_steps // 2
-    L2 = num_steps - L1  # allow odd L (put extra step in the second half)
+    L2 = num_steps - L1  # allow odd L (extra step in the second half)
 
     # repelling
     q, p, lp, glp = _half_trajectory(
@@ -161,21 +167,28 @@ def rahmc_step(
     # flip momentum
     p = -p
 
-    kin1 = half * jnp.sum(p**2, axis=-1)
-    H1 = -lp + kin1
+    # compute final energies
+    kin1 = 0.5 * jnp.sum(p**2, axis=-1)
+    H1 = -lp + kin1.astype(logprob_dtype)
+
+    # add overflow protection
+    H1 = jnp.where(jnp.isfinite(H1), H1, jnp.array(1e10, dtype=logprob_dtype))
+    # in extreme low-density region, H1 can become NaN or Inf.
+    # we set it to a large number so log_alpha becomes very negative and proposal is rejected.
 
     # MH test
-    log_alpha = H0 - H1
+    log_alpha = H0 - H1 # sensitive, in float64
+
     u = random.uniform(k_acc, shape=(n_chains,), dtype=logprob_dtype)
-    accept = jnp.log(u) < jnp.minimum(jnp.array(0.0, logprob_dtype), log_alpha)
+    accept = jnp.log(u) < jnp.minimum(0.0, log_alpha)
 
     new_pos = jnp.where(accept[:, None], q, state.position)
     new_lp = jnp.where(accept, lp, state.log_prob)
     new_glp = jnp.where(accept[:, None], glp, state.grad_log_prob)
-    new_acc = state.accept_count + accept.astype(state.accept_count.dtype)
+    new_acc = state.accept_count + accept.astype(jnp.int32)
 
     new_state = RAHMCState(new_pos, new_lp, new_glp, new_acc)
-    return next_key, new_state
+    return key, new_state # return fresh key
 
 
 @partial(jit, static_argnames=("log_prob_fn", "num_steps", "num_samples", "burn_in"))
@@ -191,8 +204,12 @@ def rahmc_run(
 ) -> Tuple[Array, Array, Array, RAHMCState]:
     state = rahmc_init(init_position, log_prob_fn)
     n_chains, n_dim = state.position.shape
-    eps = jnp.asarray(step_size, dtype=state.position.dtype)
-    gam = jnp.asarray(gamma, dtype=state.position.dtype)
+
+    pos_type = state.position.dtype
+    lp_type = state.log_prob.dtype
+
+    eps = jnp.asarray(step_size, dtype=pos_type)
+    gam = jnp.asarray(gamma, dtype=pos_type)
 
     # burn-in
     if burn_in > 0:
@@ -200,26 +217,31 @@ def rahmc_run(
             k, s = carry
             k, s = rahmc_step(s, eps, num_steps, gam, k, log_prob_fn)
             return (k, s), None
-        (key, state), _ = lax.scan(burn_body, (key, state), jnp.arange(burn_in))
-        state = RAHMCState(
-            position=state.position,
-            log_prob=state.log_prob,
-            grad_log_prob=state.grad_log_prob,
-            accept_count=jnp.zeros(n_chains, dtype=jnp.int32),
-        )
+        (key, state), _ = lax.scan(burn_body, (key, state), length=burn_in)
+        # reset accept counter instead of manually reconstructing state
+        state = state._replace(accept_count=jnp.zeros(n_chains, dtype=jnp.int32))
 
-    samples = jnp.zeros((num_samples, n_chains, n_dim), dtype=state.position.dtype)
-    lps = jnp.zeros((num_samples, n_chains), dtype=state.log_prob.dtype)
+    # samples = jnp.zeros((num_samples, n_chains, n_dim), dtype=pos_type)
+    # lps = jnp.zeros((num_samples, n_chains), dtype=lp_type)
 
-    def body(carry, t):
-        k, s, xs, lvals = carry
+    ## This is extremely inefficient memory usage, we are carrying the entire sample arrays!
+    # def body(carry, t):
+    #     k, s, xs, lvals = carry
+    #     k, s = rahmc_step(s, eps, num_steps, gam, k, log_prob_fn)
+    #     xs = xs.at[t].set(s.position)
+    #     lvals = lvals.at[t].set(s.log_prob)
+    #     return (k, s, xs, lvals), None
+    # (key, state, samples, lps), _ = lax.scan(body, (key, state, samples, lps), jnp.arange(num_samples)) 
+    ## can't use length= here since the loop body depends on the iteration index
+
+    def body(carry, _):
+        k, s = carry
         k, s = rahmc_step(s, eps, num_steps, gam, k, log_prob_fn)
-        xs = xs.at[t].set(s.position)
-        lvals = lvals.at[t].set(s.log_prob)
-        return (k, s, xs, lvals), None
-
-    (key, state, samples, lps), _ = lax.scan(body, (key, state, samples, lps), jnp.arange(num_samples))
-
+        return (k, s), (s.position, s.log_prob)
+    
+    (key, state), (samples, lps) = lax.scan(body, (key, state), length=num_samples)
+    # JAX automatically stacks the outputs
+    
     accept_rate = state.accept_count.astype(jnp.float32) / num_samples
     return samples, lps, accept_rate, state
 
