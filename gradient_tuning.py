@@ -17,11 +17,11 @@ from GRAHMC import (
     LogProbFn,
     FrictionScheduleFn,
     rahmc_init,
-    constant_friction,
-    tanh_friction,
-    sigmoid_friction,
-    linear_friction,
-    sine_friction,
+    constant_schedule,
+    tanh_schedule,
+    sigmoid_schedule,
+    linear_schedule,
+    sine_schedule,
     standard_normal_log_prob,
     RAHMCState,
     _trajectory_with_schedule,
@@ -86,56 +86,54 @@ def params_to_dict(params: TuningParams) -> Dict[str, float]:
     }
 
 
+FRICTION_SCHEDULES = {
+    'constant': constant_schedule,
+    'tanh': tanh_schedule,
+    'sigmoid': sigmoid_schedule,
+    'linear': linear_schedule,
+    'sine': sine_schedule,
+}
 
-def create_friction_schedule(
-    schedule_type: str,
-    gamma: float,
-    steepness: float = None,
-):
-    """Create friction schedule from parameters."""
-    if schedule_type == 'constant':
-        return constant_friction(gamma)
-    elif schedule_type == 'tanh':
-        return tanh_friction(gamma, steepness)
-    elif schedule_type == 'sigmoid':
-        return sigmoid_friction(gamma, steepness)
-    elif schedule_type == 'linear':
-        return linear_friction(gamma)
-    elif schedule_type == 'sine':
-        return sine_friction(gamma)
-    else:
-        raise ValueError(f"Unknown schedule type: {schedule_type}")
+def get_friction_schedule(schedule_type: str):
+    """Returns SAME function object every time for same type."""
+    return FRICTION_SCHEDULES[schedule_type]
+
+
+# def create_friction_schedule(
+#     schedule_type: str,
+#     gamma: float,
+#     steepness: float = None,
+# ):
+#     """Create friction schedule from parameters."""
+#     if schedule_type == 'constant':
+#         return 
+#     elif schedule_type == 'tanh':
+#         return tanh_friction(gamma, steepness)
+#     elif schedule_type == 'sigmoid':
+#         return sigmoid_friction(gamma, steepness)
+#     elif schedule_type == 'linear':
+#         return linear_friction(gamma)
+#     elif schedule_type == 'sine':
+#         return sine_friction(gamma)
+#     else:
+#         raise ValueError(f"Unknown schedule type: {schedule_type}")
+
 
 
 # %%
-@partial(jit, static_argnames=("log_prob_fn", "return_proposal", "num_steps", "friction_schedule"))
+@partial(jit, static_argnames=("log_prob_fn", "return_proposal", "friction_schedule"))
 def rahmc_step(
     state: RAHMCState,
     step_size: float,
     num_steps: int,
     gamma_max: float,
+    steepness: float,
     key: Array,
     log_prob_fn: LogProbFn,
     friction_schedule: FrictionScheduleFn = None,
-    return_proposal: bool = False,
+    return_proposal: bool = False, # return proposal positions and log probs (key, new_state, proposal_position, proposal_log_prob)
 ) -> Tuple[Array, RAHMCState] | Tuple[Array, RAHMCState, Array, Array]:
-    """
-    RA-HMC step with optional proposal tracking.
-    
-    Args:
-        state: Current RAHMC state
-        step_size: Step size epsilon
-        num_steps: Number of leapfrog steps
-        gamma_max: Maximum friction value
-        key: PRNG key
-        log_prob_fn: Log probability function
-        friction_schedule: Friction schedule function
-        return_proposal: If True, return proposal positions and log probs
-    
-    Returns:
-        If return_proposal=False: (key, new_state)
-        If return_proposal=True: (key, new_state, proposal_position, proposal_log_prob)
-    """
+    """RAHMC step with optional proposal tracking."""
     if friction_schedule is None:
         friction_schedule = constant_friction(gamma_max)
 
@@ -154,7 +152,7 @@ def rahmc_step(
     total_time = step_size * num_steps
 
     q, p, lp, glp = _trajectory_with_schedule(
-        state.position, p0, step_size, gamma_max, 
+        state.position, p0, step_size, gamma_max, steepness,
         state.log_prob, state.grad_log_prob,
         num_steps, time_offset=0.0, total_time=total_time,
         log_prob_fn=log_prob_fn, friction_schedule=friction_schedule,
@@ -191,7 +189,7 @@ def rahmc_step(
         return key, new_state
     
     
-@partial(jit, static_argnames=("log_prob_fn", "num_samples", "burn_in", "track_proposals", "num_steps", "friction_schedule"))
+@partial(jit, static_argnames=("log_prob_fn", "num_samples", "burn_in", "track_proposals", "friction_schedule"))
 def rahmc_run(
     key: Array,
     log_prob_fn: LogProbFn,
@@ -199,6 +197,7 @@ def rahmc_run(
     step_size: float,
     num_steps: int,
     gamma: float,
+    steepness: float,
     num_samples: int,
     burn_in: int = 0,
     friction_schedule: FrictionScheduleFn = None,
@@ -234,12 +233,13 @@ def rahmc_run(
 
     eps = jnp.asarray(step_size, dtype=pos_type)
     gam = jnp.asarray(gamma, dtype=pos_type)
+    steep = jnp.asarray(steepness, dtype=pos_type)
 
     # burn-in
     if burn_in > 0:
         def burn_body(carry, _):
             k, s = carry
-            k, s = rahmc_step(s, eps, num_steps, gam, k, log_prob_fn, friction_schedule, return_proposal=False)
+            k, s = rahmc_step(s, eps, num_steps, gam, steep, k, log_prob_fn, friction_schedule, return_proposal=False)
             return (k, s), None
         (key, state), _ = lax.scan(burn_body, (key, state), length=burn_in)
         state = state._replace(accept_count=jnp.zeros(n_chains, dtype=jnp.int32))
@@ -250,7 +250,7 @@ def rahmc_run(
             k, s = carry
             pre_pos, pre_lp = s.position, s.log_prob
             k, s, prop_pos, prop_lp, delta_H = rahmc_step(
-                s, eps, num_steps, gam, k, log_prob_fn, friction_schedule, return_proposal=True
+                s, eps, num_steps, gam, steep, k, log_prob_fn, friction_schedule, return_proposal=True
             )
             return (k, s), (pre_pos, pre_lp, prop_pos, prop_lp, delta_H, s.position, s.log_prob)
         
@@ -273,7 +273,7 @@ def rahmc_run(
     else:
         def body(carry, _):
             k, s = carry
-            k, s = rahmc_step(s, eps, num_steps, gam, k, log_prob_fn, friction_schedule, return_proposal=False)
+            k, s = rahmc_step(s, eps, num_steps, gam, steep, k, log_prob_fn, friction_schedule, return_proposal=False)
             return (k, s), (s.position, s.log_prob)
         
         (key, state), (samples, lps) = lax.scan(body, (key, state), length=num_samples)
@@ -323,109 +323,6 @@ def compute_proposal_esjd_soft(
     return esjd
 
 
-def compute_proposal_esjd_per_chain(
-    initial_positions: jnp.ndarray,
-    proposals: jnp.ndarray,
-    log_prob_initial: jnp.ndarray,
-    log_prob_proposal: jnp.ndarray,
-) -> jnp.ndarray:
-    """
-    Compute proposal-level ESJD per chain.
-    
-    Returns:
-        ESJD per chain: (n_chains,)
-    """
-    squared_jumps = jnp.sum((proposals - initial_positions)**2, axis=-1)
-    log_alpha = log_prob_proposal - log_prob_initial
-    alpha = jnp.minimum(1.0, jnp.exp(log_alpha))
-    weighted_jumps = squared_jumps * alpha
-    esjd_per_chain = jnp.mean(weighted_jumps, axis=0)  # Average over samples
-    return esjd_per_chain
-
-
-# def objective_proposal_esjd(
-#     params: TuningParams,
-#     key: jnp.ndarray,
-#     log_prob_fn: Callable,
-#     init_position: jnp.ndarray,
-#     num_samples: int,
-#     burn_in: int,
-#     schedule_type: str,
-# ) -> float:
-#     """
-#     Objective: Maximize proposal-level ESJD (acceptance-weighted).
-#     Returns negative ESJD for minimization.
-    
-#     This objective measures the expected squared jumping distance of proposals,
-#     weighted by their acceptance probability. It provides smooth gradients and
-#     directly optimizes the proposal mechanism.
-#     """
-#     # Convert from log space
-#     step_size = jnp.exp(params.log_step_size)
-#     num_steps = jnp.round(jnp.exp(params.log_num_steps)).astype(jnp.int32)
-#     num_steps = jnp.maximum(num_steps, 1)
-#     num_steps_int = int(num_steps)
-#     gamma = jnp.exp(params.log_gamma)
-#     steepness = jnp.exp(params.log_steepness)
-    
-#     # Create friction schedule
-#     friction_schedule = create_friction_schedule(schedule_type, gamma, steepness)
-    
-#     # Run RAHMC with proposal tracking
-#     results = rahmc_run(
-#         key=key,
-#         log_prob_fn=log_prob_fn,
-#         init_position=init_position,
-#         step_size=step_size,
-#         num_steps=num_steps_int,
-#         gamma=gamma,
-#         num_samples=num_samples,
-#         burn_in=burn_in,
-#         friction_schedule=friction_schedule,
-#         track_proposals=True,
-#     )
-    
-#     samples, lps, accept_rate, final_state, prop_positions, prop_lps = results
-    
-#     # Compute proposal-level ESJD
-#     # samples are the initial states, prop_positions are the proposals
-#     initial_positions = samples  # (n_samples, n_chains, n_dim)
-#     initial_lps = lps            # (n_samples, n_chains)
-    
-#     esjd = compute_proposal_esjd_soft(initial_positions, prop_positions, final_state.log_prob - prop_lps)
-    
-    
-#     # Penalize very low acceptance rates (we want proposals to be accepted!)
-#     mean_accept = jnp.mean(accept_rate)
-#     target_accept = 0.65
-#     accept_penalty = (mean_accept - target_accept)**2
-#     low_accept_guard = jnp.maximum(0.0, 0.15 - mean_accept)**2
-#     high_accept_guard = jnp.maximum(0.0, mean_accept - 0.9)**2
-
-#     objective_value = esjd
-#     objective_value -= 30.0 * accept_penalty
-#     objective_value -= 10.0 * (low_accept_guard + high_accept_guard)
-
-#     # Add soft constraints to keep parameters reasonable
-#     penalty = 0.0
-    
-#     # Step size constraints: 0.01 < ε < 1.0
-#     penalty += 10.0 * jnp.maximum(0.0, params.log_step_size - jnp.log(1.0))**2
-#     penalty += 10.0 * jnp.maximum(0.0, -params.log_step_size - jnp.log(0.01))**2
-    
-#     # Num steps constraints: 1 < L < 100
-#     penalty += 5.0 * jnp.maximum(0.0, params.log_num_steps - jnp.log(100.0))**2
-    
-#     # Gamma constraints: 0.01 < γ < 3.0
-#     penalty += 10.0 * jnp.maximum(0.0, params.log_gamma - jnp.log(3.0))**2
-#     penalty += 10.0 * jnp.maximum(0.0, -params.log_gamma - jnp.log(0.01))**2
-    
-#     # Steepness constraints: 0.5 < steepness < 50
-#     penalty += 5.0 * jnp.maximum(0.0, params.log_steepness - jnp.log(50.0))**2
-#     penalty += 5.0 * jnp.maximum(0.0, -params.log_steepness - jnp.log(0.5))**2
-    
-#     # Return negative for minimization
-#     return -(objective_value - penalty)
 
 def objective_proposal_esjd(
     params: TuningParams,
@@ -451,7 +348,7 @@ def objective_proposal_esjd(
     steepness = jnp.exp(params.log_steepness)
 
     # Friction schedule
-    friction_schedule = create_friction_schedule(schedule_type, gamma, steepness)
+    friction_schedule = get_friction_schedule(schedule_type)
 
     # Run with proposal tracking
     (samples, lps, accept_rate, final_state,
@@ -462,6 +359,7 @@ def objective_proposal_esjd(
         step_size=step_size,
         num_steps=num_steps,                     # JAX int; not static
         gamma=gamma,
+        steepness=steepness,
         num_samples=num_samples,
         burn_in=burn_in,
         friction_schedule=friction_schedule,
@@ -482,8 +380,8 @@ def objective_proposal_esjd(
     high_accept_guard = jnp.maximum(0.0, mean_alpha - 0.90) ** 2
 
     objective_value = esjd \
-        - 30.0 * accept_penalty \
-        - 10.0 * (low_accept_guard + high_accept_guard)
+        - 100.0 * accept_penalty \
+        - 50.0 * (low_accept_guard + high_accept_guard)
 
     # Soft parameter constraints (unchanged)
     penalty = 0.0
@@ -573,9 +471,7 @@ def optimize_parameters(
     if objective_type == 'proposal_esjd':
         objective_fn = objective_proposal_esjd_variance_reduced
         metric_name = "ESJD"
-    elif objective_type == 'variance':
-        objective_fn = objective_variance_reduced
-        metric_name = "Mixing"
+
     else:
         raise ValueError(f"Unknown objective_type: {objective_type}")
     
@@ -584,7 +480,23 @@ def optimize_parameters(
     opt_state = optimizer.init(params)
     
     # Create gradient function
-    grad_fn = jax.grad(objective_fn)
+    # grad_fn = jax.grad(objective_fn)
+
+    # cannot use GD to optimize an integer. It should only be optimized by the discrete refinement loop at the end
+    # need a grad function that only differentiates wrt the dynamic parameters (step_size, gamma, steepness)
+    # and keeps log_num_steps constant during the trace.
+
+    def objective_for_grad(p_dynamic, p_static, keys, log_prob_fn, init_pos, n_samples, b_in, s_type):
+        full_params = TuningParams(
+            log_step_size=p_dynamic.log_step_size,
+            log_num_steps=p_static.log_num_steps, # use static value
+            log_gamma=p_dynamic.log_gamma,
+            log_steepness=p_dynamic.log_steepness
+        )
+        return objective_fn(full_params, keys, log_prob_fn, init_pos, n_samples, b_in, s_type)
+
+    # Create gradient function that only differentiates the first arg (p_dynamic)
+    grad_fn = jax.grad(objective_for_grad, argnums=0)
     
     # Track history
     history = []
@@ -615,10 +527,20 @@ def optimize_parameters(
         )
         
         # Compute gradient
-        grads = grad_fn(
-            params, eval_keys, log_prob_fn, init_position,
+        # grads = grad_fn(
+        #     params, eval_keys, log_prob_fn, init_position,
+        #     num_samples, burn_in, schedule_type
+        # )
+        grads_dynamic = grad_fn(
+            params,       # arg 0: p_dynamic (gets differentiated)
+            params,       # arg 1: p_static (is frozen)
+            eval_keys, log_prob_fn, init_position,
             num_samples, burn_in, schedule_type
         )
+
+        # Ensure the gradient for log_num_steps is zero
+        # so the optimizer doesn't update it.
+        grads = grads_dynamic._replace(log_num_steps=0.0)
         
         # Update parameters
         updates, opt_state = optimizer.update(grads, opt_state)
@@ -693,6 +615,11 @@ def optimize_parameters(
         print("="*80 + "\n")
     
     return best_params, history
+
+
+
+
+
 
 # %%
 def optimize_all_schedules(
@@ -775,7 +702,7 @@ def evaluate_sampling_performance(
         gamma = params_dict["gamma"]
         steepness = params_dict["steepness"]
 
-        friction_schedule = create_friction_schedule(schedule_type, gamma, steepness)
+        friction_schedule = get_friction_schedule(schedule_type)
 
         # Run sampling with proposal tracking
         import time
@@ -787,6 +714,7 @@ def evaluate_sampling_performance(
             step_size=step_size,
             num_steps=num_steps,
             gamma=gamma,
+            steepness=steepness,
             num_samples=num_samples,
             burn_in=burn_in,
             friction_schedule=friction_schedule,
@@ -920,8 +848,8 @@ def plot_friction_schedules(results: Dict[str, Tuple[TuningParams, List[Dict]]])
         gamma = params_dict['gamma']
         steepness = params_dict['steepness']
         
-        friction_fn = create_friction_schedule(schedule_type, gamma, steepness)
-        gamma_vals = vmap(lambda t: friction_fn(t, 1.0))(t_vals)
+        friction_fn = get_friction_schedule(schedule_type)
+        gamma_vals = vmap(lambda t: friction_fn(t, 1.0, gamma, steepness))(t_vals)
         
         ax.plot(t_vals, gamma_vals, 
                label=f"{schedule_type} (γ={gamma:.3f})",
@@ -1147,9 +1075,9 @@ os.environ['JAX_LOG_COMPILES'] = '1'
 
 results, performance = run_complete_analysis(
     dim=10,
-    n_optimization_steps=50,
+    n_optimization_steps=100,
     n_eval_samples=5000,
-    seed=42,
+    seed=30,
 )
 
 # Print summary table
