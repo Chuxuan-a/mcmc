@@ -11,6 +11,9 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import seaborn as sns
 
+import os
+os.environ['JAX_ENABLE_X64'] = 'True' # Enable float64 for better numerical stability
+
 
 from GRAHMC import (
     Array,
@@ -75,6 +78,12 @@ class TuningParams(NamedTuple):
     log_gamma: float          # log(gamma)
     log_steepness: float      # log(steepness) - for tanh/sigmoid
 
+class DynamicParams(NamedTuple):
+    """Parameters to optimize via gradient descent."""
+    log_step_size: float
+    log_gamma: float
+    log_steepness: float
+
 
 def params_to_dict(params: TuningParams) -> Dict[str, float]:
     """Convert TuningParams to human-readable dict."""
@@ -121,7 +130,7 @@ def get_friction_schedule(schedule_type: str):
 
 
 # %%
-@partial(jit, static_argnames=("log_prob_fn", "return_proposal", "friction_schedule"))
+@partial(jit, static_argnames=("log_prob_fn", "return_proposal", "friction_schedule", "num_steps"))
 def rahmc_step(
     state: RAHMCState,
     step_size: float,
@@ -189,7 +198,7 @@ def rahmc_step(
         return key, new_state
     
     
-@partial(jit, static_argnames=("log_prob_fn", "num_samples", "burn_in", "track_proposals", "friction_schedule"))
+@partial(jit, static_argnames=("log_prob_fn", "num_samples", "burn_in", "track_proposals", "friction_schedule", "num_steps"))
 def rahmc_run(
     key: Array,
     log_prob_fn: LogProbFn,
@@ -325,7 +334,9 @@ def compute_proposal_esjd_soft(
 
 
 def objective_proposal_esjd(
-    params: TuningParams,
+    # params: TuningParams,
+    dyn_params: DynamicParams,
+    log_num_steps: float, # static argument
     key: jnp.ndarray,
     log_prob_fn: Callable,
     init_position: jnp.ndarray,
@@ -336,10 +347,14 @@ def objective_proposal_esjd(
     """
     Maximize proposal-level ESJD (acceptance-weighted by ΔH) using the pre-step state.
     Returns the NEGATIVE value for minimization.
-    Expects rahmc_run(..., track_proposals=True) to return:
-      (samples, lps, accept_rate, final_state,
-       pre_positions, pre_lps, prop_positions, prop_lps, deltas_H)
     """
+    # reconstruct full params from dynamic and static parts
+    params = TuningParams(
+        log_step_size=dyn_params.log_step_size,
+        log_num_steps=log_num_steps,
+        log_gamma=dyn_params.log_gamma,
+        log_steepness=dyn_params.log_steepness
+    )
 
     # Continuous params
     step_size = jnp.exp(params.log_step_size)
@@ -372,6 +387,8 @@ def objective_proposal_esjd(
     # If gradients are twitchy, try: alpha = jax.nn.sigmoid(-deltas_H / 1.0)
     esjd = jnp.mean(squared_jumps * alpha)
 
+    log_esjd = jnp.log(esjd + 1e-10)
+
     # Differentiable acceptance guard (from α above)
     mean_alpha = jnp.mean(alpha)
     target_accept = 0.65
@@ -379,19 +396,23 @@ def objective_proposal_esjd(
     low_accept_guard  = jnp.maximum(0.0, 0.15 - mean_alpha) ** 2
     high_accept_guard = jnp.maximum(0.0, mean_alpha - 0.90) ** 2
 
-    objective_value = esjd \
-        - 100.0 * accept_penalty \
-        - 50.0 * (low_accept_guard + high_accept_guard)
+    objective_value = log_esjd \
+        - 50.0 * accept_penalty \
+        - 25.0 * (low_accept_guard + high_accept_guard)
 
-    # Soft parameter constraints (unchanged)
+    # Soft parameter constraints
     penalty = 0.0
-    penalty += 10.0 * jnp.maximum(0.0, params.log_step_size - jnp.log(1.0)) ** 2
-    penalty += 10.0 * jnp.maximum(0.0, -params.log_step_size - jnp.log(0.01)) ** 2
-    penalty += 5.0  * jnp.maximum(0.0, params.log_num_steps - jnp.log(100.0)) ** 2
-    penalty += 10.0 * jnp.maximum(0.0, params.log_gamma - jnp.log(3.0)) ** 2
-    penalty += 10.0 * jnp.maximum(0.0, -params.log_gamma - jnp.log(0.01)) ** 2
-    penalty += 5.0  * jnp.maximum(0.0, params.log_steepness - jnp.log(50.0)) ** 2
-    penalty += 5.0  * jnp.maximum(0.0, -params.log_steepness - jnp.log(0.5)) ** 2
+    penalty += 1.0 * jnp.maximum(0.0, params.log_step_size - jnp.log(1.0)) ** 2
+    penalty += 1.0 * jnp.maximum(0.0, -params.log_step_size - jnp.log(0.01)) ** 2
+
+    penalty += 5.0 * jnp.maximum(0.0, jnp.log(10.0) - params.log_num_steps) ** 2
+    penalty += 1.0 * jnp.maximum(0.0, params.log_num_steps - jnp.log(100.0)) ** 2
+    
+    penalty += 100.0 * jnp.maximum(0.0, params.log_gamma - jnp.log(1.5)) ** 2
+    penalty += 1.0 * jnp.maximum(0.0, jnp.log(0.01) - params.log_gamma) ** 2
+
+    penalty += 0.5 * jnp.maximum(0.0, params.log_steepness - jnp.log(50.0)) ** 2
+    penalty += 0.5 * jnp.maximum(0.0, jnp.log(0.5) - params.log_steepness) ** 2
 
     return -(objective_value - penalty)
 
@@ -399,7 +420,9 @@ def objective_proposal_esjd(
 
 
 def objective_proposal_esjd_variance_reduced(
-    params: TuningParams,
+    #params: TuningParams,
+    dyn_params: DynamicParams,
+    log_num_steps: float, # static argument
     keys: jnp.ndarray,
     log_prob_fn: Callable,
     init_position: jnp.ndarray,
@@ -411,7 +434,8 @@ def objective_proposal_esjd_variance_reduced(
     
     def single_run(key):
         return objective_proposal_esjd(
-            params, key, log_prob_fn, init_position,
+            dyn_params, log_num_steps,
+            key, log_prob_fn, init_position,
             num_samples, burn_in, schedule_type
         )
     
@@ -427,81 +451,58 @@ def optimize_parameters(
     schedule_type: str,
     num_samples: int = 1000,
     burn_in: int = 500,
-    n_optimization_steps: int = 50,
+    n_optimization_steps: int = 200,
     n_runs_per_eval: int = 3,
     learning_rate: float = 0.02,
     initial_params: TuningParams = None,
     verbose: bool = True,
-    objective_type: str = 'proposal_esjd',  # NEW: 'proposal_esjd' or 'variance'
+    objective_type: str = 'proposal_esjd',
 ) -> Tuple[TuningParams, List[Dict]]:
-    """
-    Optimize RAHMC parameters using gradient descent.
-    
-    Args:
-        key: PRNG key
-        log_prob_fn: Target log probability
-        init_position: Initial position for chains
-        schedule_type: Type of friction schedule
-        num_samples: Samples per evaluation
-        burn_in: Burn-in per evaluation
-        n_optimization_steps: Number of optimization iterations
-        n_runs_per_eval: Runs per evaluation (variance reduction)
-        learning_rate: Learning rate for Adam
-        initial_params: Starting parameters (None for defaults)
-        verbose: Print progress
-        objective_type: 'proposal_esjd' or 'variance'
-    
-    Returns:
-        optimal_params: Best parameters found
-        history: List of dicts with optimization history
-    """
+    """Optimize RAHMC parameters using gradient descent."""
     
     # Initialize parameters
     if initial_params is None:
-        params = TuningParams(
+        initial_params = TuningParams(
             log_step_size=jnp.log(0.15),
             log_num_steps=jnp.log(15.0),
             log_gamma=jnp.log(0.5),
             log_steepness=jnp.log(5.0),
         )
     else:
-        params = initial_params
+        initial_params = initial_params
     
+    # Separate dynamic (optimized) params from static (fixed) params
+    dyn_params = DynamicParams(
+        log_step_size=initial_params.log_step_size,
+        log_gamma=initial_params.log_gamma,
+        log_steepness=initial_params.log_steepness
+    )
+    # Store log_num_steps separately. It will be treated as a static constant.
+    current_log_num_steps = initial_params.log_num_steps
+
     # Choose objective function
     if objective_type == 'proposal_esjd':
         objective_fn = objective_proposal_esjd_variance_reduced
         metric_name = "ESJD"
-
     else:
         raise ValueError(f"Unknown objective_type: {objective_type}")
     
     # Create optimizer
     optimizer = optax.adam(learning_rate)
-    opt_state = optimizer.init(params)
+    # Initialize the optimizer *only* with the dynamic params
+    opt_state = optimizer.init(dyn_params)
     
     # Create gradient function
-    # grad_fn = jax.grad(objective_fn)
-
-    # cannot use GD to optimize an integer. It should only be optimized by the discrete refinement loop at the end
-    # need a grad function that only differentiates wrt the dynamic parameters (step_size, gamma, steepness)
-    # and keeps log_num_steps constant during the trace.
-
-    def objective_for_grad(p_dynamic, p_static, keys, log_prob_fn, init_pos, n_samples, b_in, s_type):
-        full_params = TuningParams(
-            log_step_size=p_dynamic.log_step_size,
-            log_num_steps=p_static.log_num_steps, # use static value
-            log_gamma=p_dynamic.log_gamma,
-            log_steepness=p_dynamic.log_steepness
-        )
-        return objective_fn(full_params, keys, log_prob_fn, init_pos, n_samples, b_in, s_type)
-
-    # Create gradient function that only differentiates the first arg (p_dynamic)
-    grad_fn = jax.grad(objective_for_grad, argnums=0)
+    # We differentiate wrt arg 0 (dyn_params)
+    # log_num_steps (arg 1) is static and will not be traced.
+    grad_fn = jax.grad(objective_fn, argnums=0)
     
     # Track history
     history = []
     best_neg_metric = jnp.inf
-    best_params = params
+    # Store the best *dynamic* params and *static* L
+    best_dyn_params = dyn_params
+    best_log_num_steps = current_log_num_steps
     
 
     if verbose:
@@ -522,37 +523,37 @@ def optimize_parameters(
         
         # Evaluate objective
         neg_metric = objective_fn(
-            params, eval_keys, log_prob_fn, init_position,
+            dyn_params, current_log_num_steps, # Pass separately
+            eval_keys, log_prob_fn, init_position,
             num_samples, burn_in, schedule_type
         )
         
         # Compute gradient
-        # grads = grad_fn(
-        #     params, eval_keys, log_prob_fn, init_position,
-        #     num_samples, burn_in, schedule_type
-        # )
-        grads_dynamic = grad_fn(
-            params,       # arg 0: p_dynamic (gets differentiated)
-            params,       # arg 1: p_static (is frozen)
+        grads = grad_fn(
+            dyn_params, current_log_num_steps, # Pass separately
             eval_keys, log_prob_fn, init_position,
             num_samples, burn_in, schedule_type
         )
-
-        # Ensure the gradient for log_num_steps is zero
-        # so the optimizer doesn't update it.
-        grads = grads_dynamic._replace(log_num_steps=0.0)
         
         # Update parameters
         updates, opt_state = optimizer.update(grads, opt_state)
-        params = optax.apply_updates(params, updates)
+        dyn_params = optax.apply_updates(dyn_params, updates)
         
         # Track best
         if neg_metric < best_neg_metric:
             best_neg_metric = neg_metric
-            best_params = params
+            best_dyn_params = dyn_params
+            # best_log_num_steps remains current_log_num_steps
         
         # Record history
-        params_dict = params_to_dict(params)
+        # Rebuild full params for logging
+        full_params = TuningParams(
+            dyn_params.log_step_size,
+            current_log_num_steps,
+            dyn_params.log_gamma,
+            dyn_params.log_steepness
+        )
+        params_dict = params_to_dict(full_params)
         history.append({
             'iteration': iteration,
             f'neg_{metric_name.lower()}': float(neg_metric),
@@ -568,32 +569,55 @@ def optimize_parameters(
                   f"γ={params_dict['gamma']:.4f}, "
                   f"steep={params_dict['steepness']:.2f}")
     
-    # Discrete refinement over num_steps to find the best integer trajectory length
+
+    # Combine the best dynamic params with the best static L
+    best_full_params = TuningParams(
+        best_dyn_params.log_step_size,
+        best_log_num_steps,
+        best_dyn_params.log_gamma,
+        best_dyn_params.log_steepness
+    )
+    refined_params = best_full_params # This is now the starting point
+    
+    # We need the dyn_params from the best run for the refinement loop
+    refined_dyn_params = DynamicParams(
+        refined_params.log_step_size,
+        refined_params.log_gamma,
+        refined_params.log_steepness
+    )
+
     key, *refine_keys = random.split(key, n_runs_per_eval + 1)
     if len(refine_keys) == 0:
         key, extra_key = random.split(key)
         refine_keys = jnp.array([extra_key])
     else:
         refine_keys = jnp.array(refine_keys)
-    refined_params = best_params
+
     refined_neg_metric = objective_fn(
-        refined_params, refine_keys, log_prob_fn, init_position,
+        refined_dyn_params, refined_params.log_num_steps, # Pass separately
+        refine_keys, log_prob_fn, init_position,
         num_samples, burn_in, schedule_type
     )
+    
     for L_candidate in range(1, 81):
-        candidate_params = refined_params._replace(log_num_steps=jnp.log(float(L_candidate)))
+        candidate_log_num_steps = jnp.log(float(L_candidate))
+        
+        # dyn_params are fixed, only test new L
         neg_metric_candidate = objective_fn(
-            candidate_params, refine_keys, log_prob_fn, init_position,
+            refined_dyn_params, candidate_log_num_steps, # Pass separately
+            refine_keys, log_prob_fn, init_position,
             num_samples, burn_in, schedule_type
         )
+        
         if neg_metric_candidate < refined_neg_metric:
             refined_neg_metric = neg_metric_candidate
-            refined_params = candidate_params
+            refined_params = refined_params._replace(log_num_steps=candidate_log_num_steps)
+
     if refined_neg_metric < best_neg_metric:
         best_neg_metric = refined_neg_metric
-        best_params = refined_params
+        best_full_params = refined_params
         if history:
-            refined_dict = params_to_dict(best_params)
+            refined_dict = params_to_dict(best_full_params)
             history.append({
                 'iteration': history[-1]['iteration'] + 1,
                 f'neg_{metric_name.lower()}': float(refined_neg_metric),
@@ -605,7 +629,7 @@ def optimize_parameters(
         print("\n" + "-"*80)
         print("OPTIMIZATION COMPLETE")
         print("-"*80)
-        best_dict = params_to_dict(best_params)
+        best_dict = params_to_dict(best_full_params)
         print(f"Best {metric_name}: {-float(best_neg_metric):.3f}")
         print(f"Optimal parameters:")
         print(f"  ε (step_size) = {best_dict['step_size']:.4f}")
@@ -614,8 +638,7 @@ def optimize_parameters(
         print(f"  steepness     = {best_dict['steepness']:.2f}")
         print("="*80 + "\n")
     
-    return best_params, history
-
+    return best_full_params, history
 
 
 
@@ -1075,7 +1098,7 @@ os.environ['JAX_LOG_COMPILES'] = '1'
 
 results, performance = run_complete_analysis(
     dim=10,
-    n_optimization_steps=100,
+    n_optimization_steps=300,
     n_eval_samples=5000,
     seed=30,
 )
