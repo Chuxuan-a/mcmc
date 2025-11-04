@@ -1,0 +1,6 @@
+arviz==0.22.0
+jax==0.8.0
+matplotlib==3.10.7
+numpy==2.3.4
+optax==0.2.6
+seaborn==0.13.2
