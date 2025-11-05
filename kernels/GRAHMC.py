@@ -9,17 +9,10 @@ import jax
 import jax.numpy as jnp
 from jax import jit, random, vmap, lax
 
-# type aliases
+# from utils import Array, LogProbFn, FrictionScheduleFn, _ensure_batched
 Array = jnp.ndarray
 LogProbFn = Callable[[Array], Array]  # x -> log p(x)
-FrictionScheduleFn = Callable[[float, float], float] # (t, T) -> gamma(t)
-
-
-class RAHMCState(NamedTuple):
-    position: Array        # float32: (n_chains, n_dim)
-    log_prob: Array        # float64: (n_chains,)
-    grad_log_prob: Array   # float32: (n_chains, n_dim)
-    accept_count: Array    # int32: (n_chains,)
+FrictionScheduleFn = Callable[[float, float, float, float | None], float] # (t, T, gamma_max, steepness) -> gamma(t)
 
 
 def _ensure_batched(x: Array) -> Tuple[Array, bool]:
@@ -38,10 +31,17 @@ def standard_normal_log_prob(x: Array) -> Array:
     two_pi = jnp.array(2.0 * jnp.pi, dtype=x.dtype)
     return -0.5 * (jnp.sum(x**2, axis=-1) + D * jnp.log(two_pi))
 
+
+class RAHMCState(NamedTuple):
+    position: Array        # float32: (n_chains, n_dim)
+    log_prob: Array        # float64: (n_chains,)
+    grad_log_prob: Array   # float32: (n_chains, n_dim)
+    accept_count: Array    # int32: (n_chains,)
+
+
 # ============================================================================
 # Friction Schedule Functions
 # ============================================================================
-
 
 # This version creates a new function object every time. It's a closure that captures gamma and steepness.
 # def tanh_friction(gamma_max: float, steepness: float = 5.0) -> FrictionScheduleFn:
@@ -140,18 +140,20 @@ def _trajectory_with_schedule(
     log_prob: Array,
     grad_log_prob: Array,
     num_steps: int,
-    time_offset: float, # starting time for this half-trajectory
-    total_time: float, # total trajectory length T
+    # time_offset: float, # starting time for this half-trajectory
+    # total_time: float, # total trajectory length T
+    # these two are not necessary since our friction function's behavior is dictated by t/T.
     log_prob_fn: LogProbFn,
     friction_schedule: FrictionScheduleFn,
 ):
+    """Run a full leapfrog trajectory with time-dependent friction schedule."""
+    total_time = step_size * num_steps
+
     def body(carry, step_idx):
         q, p, lp, glp = carry
-        
         # compute current time and friction at this time
-        current_time = time_offset + step_idx * step_size
+        current_time = step_idx * step_size
         gamma_t = friction_schedule(current_time, total_time, gamma_max, steepness)
-
         q, p, lp, glp = _conformal_leapfrog_step(
             q, p, step_size, gamma_t, lp, glp, log_prob_fn
         )
@@ -163,7 +165,7 @@ def _trajectory_with_schedule(
     return q, p, lp, glp
 
 
-@partial(jit, static_argnames=("log_prob_fn"))
+@partial(jit, static_argnames=("log_prob_fn", "friction_schedule", "num_steps", "return_proposal"))
 def rahmc_step(
     state: RAHMCState,
     step_size: float,
@@ -173,17 +175,11 @@ def rahmc_step(
     key: Array,
     log_prob_fn: LogProbFn,
     friction_schedule: FrictionScheduleFn = None,
+    return_proposal: bool = False,
 ) -> Tuple[Array, RAHMCState]:
-    """
-    RA-HMC step:
-      - sample p ~ N(0, I)
-      - first ⌊L/2⌋ conformal steps with gamma_rep = -gamma (repelling)
-      - then ⌊L/2⌋ steps with gamma_att = +gamma (attracting)
-      - flip momentum
-      - MH accept/reject (Jacobian=1)
-    """
+
     if friction_schedule is None:
-        friction_schedule = constant_friction(gamma_max)
+        friction_schedule = constant_schedule
 
     n_chains, n_dim = state.position.shape
     pos_dtype = state.position.dtype
@@ -203,7 +199,7 @@ def rahmc_step(
     q, p, lp, glp = _trajectory_with_schedule(
         state.position, p0, step_size, gamma_max, steepness,
         state.log_prob, state.grad_log_prob,
-        num_steps, time_offset=0.0, total_time=total_time,
+        num_steps, 
         log_prob_fn=log_prob_fn, friction_schedule=friction_schedule,
     )
 
@@ -213,7 +209,6 @@ def rahmc_step(
     # compute final energies
     kin1 = 0.5 * jnp.sum(p**2, axis=-1)
     H1 = -lp + kin1.astype(logprob_dtype)
-
     # add overflow protection
     H1 = jnp.where(jnp.isfinite(H1), H1, jnp.array(1e10, dtype=logprob_dtype))
     # in extreme low-density region, H1 can become NaN or Inf.
@@ -221,6 +216,7 @@ def rahmc_step(
 
     # MH test
     log_alpha = H0 - H1 # sensitive, in float64
+    delta_H = H1 - H0
 
     u = random.uniform(k_acc, shape=(n_chains,), dtype=logprob_dtype)
     accept = jnp.log(u) < jnp.minimum(0.0, log_alpha)
@@ -231,10 +227,14 @@ def rahmc_step(
     new_acc = state.accept_count + accept.astype(jnp.int32)
 
     new_state = RAHMCState(new_pos, new_lp, new_glp, new_acc)
-    return key, new_state # return fresh key
+    
+    if return_proposal:
+        return key, new_state, q, lp, delta_H
+    else:
+        return key, new_state
 
 
-@partial(jit, static_argnames=("log_prob_fn", "num_samples", "burn_in"))
+@partial(jit, static_argnames=("log_prob_fn", "num_samples", "burn_in", "friction_schedule", "track_proposals", "num_steps"))
 def rahmc_run(
     key: Array,
     log_prob_fn: LogProbFn,
@@ -246,14 +246,16 @@ def rahmc_run(
     num_samples: int,
     burn_in: int = 0,
     friction_schedule: FrictionScheduleFn = None,
-) -> Tuple[Array, Array, Array, RAHMCState]:
+    track_proposals: bool = False,
+) -> Tuple:
+    
     if friction_schedule is None:
-        friction_schedule = constant_friction(gamma)
+        friction_schedule = constant_schedule
+
     state = rahmc_init(init_position, log_prob_fn)
-    n_chains, n_dim = state.position.shape
+    n_chains = state.position.shape[0]
 
     pos_type = state.position.dtype
-    lp_type = state.log_prob.dtype
 
     eps = jnp.asarray(step_size, dtype=pos_type)
     gam = jnp.asarray(gamma, dtype=pos_type)
@@ -263,23 +265,48 @@ def rahmc_run(
     if burn_in > 0:
         def burn_body(carry, _):
             k, s = carry
-            k, s = rahmc_step(s, eps, num_steps, gam, steep, k, log_prob_fn, friction_schedule)
+            k, s = rahmc_step(s, eps, num_steps, gam, steep, k, log_prob_fn, friction_schedule, return_proposal=False)
             return (k, s), None
         (key, state), _ = lax.scan(burn_body, (key, state), length=burn_in)
         # reset accept counter instead of manually reconstructing state
         state = state._replace(accept_count=jnp.zeros(n_chains, dtype=jnp.int32))
 
-    def body(carry, _):
-        k, s = carry
-        k, s = rahmc_step(s, eps, num_steps, gam, steep, k, log_prob_fn, friction_schedule)
-        return (k, s), (s.position, s.log_prob)
-    
-    (key, state), (samples, lps) = lax.scan(body, (key, state), length=num_samples)
-    # JAX automatically stacks the outputs
-    
-    accept_rate = state.accept_count.astype(jnp.float32) / num_samples
-    return samples, lps, accept_rate, state
+    # sampling
+    if track_proposals:
+        def body_with_proposals(carry, _):
+            k, s = carry
+            pre_pos, pre_lp = s.position, s.log_prob
+            k, s, prop_pos, prop_lp, delta_H = rahmc_step(
+                s, eps, num_steps, gam, steep, k, log_prob_fn, friction_schedule, return_proposal=True
+            )
+            return (k, s), (pre_pos, pre_lp, prop_pos, prop_lp, delta_H, s.position, s.log_prob)
+        
+        # (key, state), (samples, lps, prop_positions, prop_lps, delta_H) = lax.scan(
+        #     body_with_proposals, (key, state), length=num_samples
+        # )
+        (key, state), (pre_positions, pre_lps, prop_positions, prop_lps, deltas_H, post_positions, post_lps) = lax.scan(
+            body_with_proposals, (key, state), length=num_samples
+        )
+        
+        accept_rate = state.accept_count.astype(jnp.float32) / num_samples
 
+        return (
+            post_positions, post_lps,          # samples, lps (post-MH)
+            accept_rate, state,                # accept stats + final state
+            pre_positions, pre_lps,            # pre-step state (for ESJD)
+            prop_positions, prop_lps,          # proposals
+            deltas_H
+        )
+    else:
+        def body(carry, _):
+            k, s = carry
+            k, s = rahmc_step(s, eps, num_steps, gam, steep, k, log_prob_fn, friction_schedule, return_proposal=False)
+            return (k, s), (s.position, s.log_prob)
+        
+        (key, state), (samples, lps) = lax.scan(body, (key, state), length=num_samples)
+        
+        accept_rate = state.accept_count.astype(jnp.float32) / num_samples
+        return samples, lps, accept_rate, state
 
 
 
