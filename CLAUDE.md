@@ -10,15 +10,16 @@ This is a research codebase for developing and benchmarking MCMC (Markov Chain M
 
 ### Sampler Implementations (samplers/)
 
-The repository contains four MCMC sampler implementations, all built with JAX:
+The repository contains five MCMC sampler implementations, all built with JAX:
 
 - **RWMH.py**: Random Walk Metropolis-Hastings baseline sampler
 - **HMC.py**: Standard Hamiltonian Monte Carlo
 - **RAHMC.py**: Randomized Adaptive HMC with constant friction
 - **GRAHMC.py**: Generalized RAHMC with multiple friction schedule functions
+- **NUTS.py**: No-U-Turn Sampler with automatic trajectory length selection
 
 All samplers follow a consistent pattern:
-1. State is stored in NamedTuples (e.g., `RAHMCState`, `HMCState`)
+1. State is stored in NamedTuples (e.g., `RAHMCState`, `HMCState`, `NUTSState`)
 2. Each has an `*_init()` function that accepts initial positions and returns initialized state
 3. Each has a `*_run()` function that performs sampling with burn-in
 4. Position arrays are always batched as `(n_chains, n_dim)` for parallel chain execution
@@ -34,6 +35,50 @@ Five friction schedules are implemented for GRAHMC:
 - `sine_schedule`: Sinusoidal variation
 
 Each schedule takes `(t, T, gamma_max, steepness)` as parameters. Access via `FRICTION_SCHEDULES` dict or `get_friction_schedule(schedule_type)`.
+
+### NUTS Implementation (NUTS.py)
+
+The No-U-Turn Sampler (NUTS) automatically selects trajectory lengths using iterative tree doubling:
+
+**Key features:**
+- **Iterative tree doubling**: Builds trajectory by doubling tree depth (2^0, 2^1, 2^2, ... steps)
+- **U-turn detection**: Stops when trajectory starts doubling back on itself
+- **Slice sampling**: Uses slice variable for proposal selection (always "accepts")
+- **Multinomial sampling**: Samples proposals proportional to number of valid states in subtrees
+- **Gradient tracking**: Caches gradients at tree endpoints to avoid recomputation
+- **Divergence detection**: Flags when energy change exceeds `delta_max` threshold
+
+**Return values:**
+- `nuts_run()` returns: `(samples, log_probs, accept_rate, final_state, tree_depths, mean_accept_probs)`
+- `tree_depths`: Depth reached for each sample (max trajectory = 2^depth steps)
+- `mean_accept_probs`: Mean Metropolis-Hastings acceptance probability from leapfrog steps
+
+**Important implementation details:**
+- Uses `lax.while_loop` for iterative doubling (not recursion) to enable JIT compilation
+- Tracks `_TrajectoryState` with left/right endpoints and their gradients
+- Proposal counting: Valid subtree of depth d contributes 2^d states to multinomial sampling
+- Energy and slice threshold computed once per NUTS step with consistent momentum
+
+### Testing Framework (test_samplers.py)
+
+Comprehensive test suite for validating all samplers on standard normal distribution:
+
+**Dual averaging tuning:**
+- Automatically tunes sampler hyperparameters using Hoffman & Gelman (2014) algorithm
+- RWMH: Tunes proposal scale (target acceptance: 0.234)
+- HMC: Tunes step size with fixed trajectory length (target acceptance: 0.65)
+- NUTS: Tunes step size with automatic trajectory length (target acceptance: 0.65)
+- GRAHMC: Coordinate-wise tuning of step_size, gamma, and steepness (target acceptance: 0.65)
+
+**Convergence diagnostics:**
+- Split R-hat (rank-normalized) for convergence detection
+- Bulk and tail ESS (Effective Sample Size) using ArviZ
+- Summary statistics validation (mean ≈ 0, std ≈ 1 for standard normal)
+
+**Adaptive sampling:**
+- Collects samples in batches until target ESS is reached
+- Maintains chain continuity across batches
+- Reports ESS progress after each batch
 
 ### Parameter Tuning Framework (tuning.py)
 
@@ -74,6 +119,32 @@ Critical JAX patterns used throughout:
 
 ## Common Commands
 
+### Testing samplers
+```bash
+# Test individual samplers on 10D standard normal (with dual averaging tuning)
+
+# Random Walk Metropolis-Hastings
+python test_samplers.py --sampler rwmh --dim 10 --chains 4 --target-ess 500
+
+# Hamiltonian Monte Carlo
+python test_samplers.py --sampler hmc --dim 10 --chains 4 --target-ess 500
+
+# No-U-Turn Sampler (NUTS)
+python test_samplers.py --sampler nuts --dim 10 --chains 4 --target-ess 500
+
+# GRAHMC with constant friction (equivalent to RAHMC)
+python test_samplers.py --sampler grahmc --schedule constant --dim 10 --chains 4 --target-ess 500
+
+# GRAHMC with smooth schedules
+python test_samplers.py --sampler grahmc --schedule tanh --dim 10 --chains 4 --target-ess 500
+python test_samplers.py --sampler grahmc --schedule sigmoid --dim 10 --chains 4 --target-ess 500
+python test_samplers.py --sampler grahmc --schedule linear --dim 10 --chains 4 --target-ess 500
+python test_samplers.py --sampler grahmc --schedule sine --dim 10 --chains 4 --target-ess 500
+
+# Quick debug/test of NUTS
+python debug_nuts.py
+```
+
 ### Running the main analysis
 ```bash
 # Execute the tuning script (performs full parameter optimization)
@@ -109,6 +180,7 @@ pip install -r requirements.txt
 ### Return Value Patterns
 - Basic run: `(samples, log_probs, accept_rate, final_state)`
 - With proposal tracking: `(..., pre_positions, pre_lps, prop_positions, prop_lps, deltas_H)`
+- NUTS run: `(samples, log_probs, accept_rate, final_state, tree_depths, mean_accept_probs)`
 - Samples shape: `(num_samples, n_chains, n_dim)`
 
 ### Trajectory Integration
@@ -139,8 +211,11 @@ Uses Geyer's initial positive sequence estimator (`estimate_ess_geyer()`):
 │   ├── GRAHMC.py      # Main GRAHMC with friction schedules
 │   ├── RAHMC.py       # Basic RAHMC
 │   ├── HMC.py         # Standard HMC
+│   ├── NUTS.py        # No-U-Turn Sampler (NUTS)
 │   └── RWMH.py        # Random Walk Metropolis-Hastings
-├── tuning.py          # Automated parameter optimization
+├── test_samplers.py   # Comprehensive test suite with dual averaging
+├── debug_nuts.py      # Quick NUTS debugging script
+├── tuning.py          # Automated parameter optimization (ESJD-based)
 ├── run.ipynb          # Benchmarking and comparison notebook
 └── requirements.txt   # Python dependencies
 ```

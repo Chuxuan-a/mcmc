@@ -26,6 +26,7 @@ from samplers.GRAHMC import (
     linear_schedule,
     sine_schedule,
 )
+from samplers.NUTS import nuts_run, nuts_init, nuts_step
 
 
 def standard_normal_log_prob(x: jnp.ndarray) -> jnp.ndarray:
@@ -637,6 +638,101 @@ def dual_averaging_tune_hmc(
     return final_step_size
 
 
+def dual_averaging_tune_nuts(
+    key: jnp.ndarray,
+    log_prob_fn,
+    init_position: jnp.ndarray,
+    max_tree_depth: int = 10,
+    target_accept: float = 0.65,  # Target acceptance rate (same as HMC)
+    tolerance: float = 0.01,
+    max_iter: int = 2000,
+    min_iter: int = 100,
+    patience: int = 10,
+) -> float:
+    """Tune NUTS step size using dual averaging until convergence.
+
+    Based on Hoffman & Gelman (2014) NUTS paper, Section 3.2.
+    Note: NUTS automatically selects trajectory length, so only step size is tuned.
+
+    Args:
+        key: JAX random key
+        log_prob_fn: Target log probability function
+        init_position: Initial positions (n_chains, n_dim)
+        max_tree_depth: Maximum tree depth (default: 10)
+        target_accept: Target acceptance rate (NUTS aims higher due to slice sampling)
+        tolerance: Convergence tolerance (relative change in parameter)
+        max_iter: Maximum number of tuning iterations
+        min_iter: Minimum iterations before checking convergence
+        patience: Number of consecutive converged iterations required
+
+    Returns:
+        Tuned step size parameter
+    """
+    # Dual averaging parameters (from Stan)
+    gamma = 0.05
+    t0 = 10.0
+    kappa = 0.75
+
+    # Initialize with d-dependent starting point
+    d = init_position.shape[-1]
+    initial_step_size = 0.5 / jnp.sqrt(d)  # Scale inversely with sqrt(dim)
+    log_step_size = jnp.log(initial_step_size)
+    mu = log_step_size  # Set target around initial
+    log_step_size_bar = 0.0
+    H_bar = 0.0
+
+    step_size = jnp.exp(log_step_size)
+    prev_step_size_bar = float(step_size)
+
+    # Run tuning iterations until convergence
+    n_samples_per_tune = 20  # More samples for better acceptance estimate
+    converged_count = 0
+
+    for m in range(1, max_iter + 1):
+        key, subkey = random.split(key)
+        # Run NUTS to collect samples and get acceptance statistics
+        _, _, _, _, tree_depths, mean_accept_probs = nuts_run(
+            subkey, log_prob_fn, init_position,
+            step_size=float(step_size), max_tree_depth=max_tree_depth,
+            num_samples=n_samples_per_tune, burn_in=0
+        )
+        # Use the mean of Metropolis acceptance probabilities from leapfrog trajectories
+        # This is the standard statistic for NUTS dual averaging (Hoffman & Gelman 2014)
+        alpha = float(jnp.mean(mean_accept_probs))
+
+        # Dual averaging update
+        eta_m = 1.0 / (m + t0)
+        H_bar = (1 - eta_m) * H_bar + eta_m * (target_accept - alpha)
+        log_step_size = mu - (jnp.sqrt(m) / gamma) * H_bar
+        m_kappa = m ** (-kappa)
+        log_step_size_bar = m_kappa * log_step_size + (1 - m_kappa) * log_step_size_bar
+
+        step_size = jnp.exp(log_step_size)
+        current_step_size_bar = float(jnp.exp(log_step_size_bar))
+
+
+        # Check convergence after minimum iterations
+        if m >= min_iter:
+            relative_change = abs(current_step_size_bar - prev_step_size_bar) / (abs(prev_step_size_bar) + 1e-10)
+            if relative_change < tolerance:
+                converged_count += 1
+            else:
+                converged_count = 0
+
+            if converged_count >= patience:
+                print(f"  Converged after {m} iterations: step_size={current_step_size_bar:.4f}, accept={alpha:.3f}")
+                return current_step_size_bar
+
+        prev_step_size_bar = current_step_size_bar
+
+        if m % 200 == 0:
+            print(f"  Tuning iteration {m}: step_size={current_step_size_bar:.4f}, accept={alpha:.3f}")
+
+    final_step_size = float(jnp.exp(log_step_size_bar))
+    print(f"  Reached max iterations ({max_iter}): step_size={final_step_size:.4f}")
+    return final_step_size
+
+
 def run_sampler(
     sampler: str,
     key: jnp.ndarray,
@@ -651,7 +747,7 @@ def run_sampler(
     """Run specified sampler with adaptive sampling until target ESS is reached.
 
     Args:
-        sampler: Name of sampler ('rwmh', 'hmc', 'rahmc', 'grahmc')
+        sampler: Name of sampler ('rwmh', 'hmc', 'rahmc', 'grahmc', 'nuts')
         key: JAX random key
         n_dim: Dimensionality of target distribution
         n_chains: Number of parallel chains
@@ -699,6 +795,17 @@ def run_sampler(
         metadata["step_size"] = step_size
         metadata["num_steps"] = num_steps
         param_str = f"step_size={step_size:.4f}, L={num_steps}"
+    elif sampler == "nuts":
+        max_tree_depth = 10  # Maximum tree depth (max trajectory = 2^10 = 1024 steps)
+        print(f"\nTuning step size (max_tree_depth={max_tree_depth} fixed)...")
+        key, tune_key = random.split(key)
+        step_size = dual_averaging_tune_nuts(
+            tune_key, standard_normal_log_prob, init_position,
+            max_tree_depth=max_tree_depth
+        )
+        metadata["step_size"] = step_size
+        metadata["max_tree_depth"] = max_tree_depth
+        param_str = f"step_size={step_size:.4f}, max_depth={max_tree_depth}"
     elif sampler in ["grahmc", "rahmc"]:
         # Map schedule type to schedule function
         schedule_map = {
@@ -763,6 +870,12 @@ def run_sampler(
             samples_batch, lps_batch, accept_rate, final_state = hmc_run(
                 sample_key, standard_normal_log_prob, current_position,
                 step_size=step_size, num_steps=num_steps,
+                num_samples=batch_size, burn_in=0
+            )
+        elif sampler == "nuts":
+            samples_batch, lps_batch, accept_rate, final_state, _, _ = nuts_run(
+                sample_key, standard_normal_log_prob, current_position,
+                step_size=step_size, max_tree_depth=max_tree_depth,
                 num_samples=batch_size, burn_in=0
             )
         elif sampler in ["grahmc", "rahmc"]:
@@ -916,7 +1029,7 @@ def main():
         "--sampler",
         type=str,
         required=True,
-        choices=["rwmh", "hmc", "rahmc", "grahmc"],
+        choices=["rwmh", "hmc", "rahmc", "grahmc", "nuts"],
         help="Sampler to test"
     )
     parser.add_argument(
