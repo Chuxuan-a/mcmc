@@ -4,18 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a research codebase for developing and benchmarking MCMC (Markov Chain Monte Carlo) samplers, with emphasis on Randomized Adaptive Hamiltonian Monte Carlo (RAHMC) with various friction schedules. The project implements multiple samplers and provides automated parameter tuning using gradient-based optimization.
+This is a research codebase for developing and benchmarking MCMC (Markov Chain Monte Carlo) samplers, with emphasis on Generalized Randomized Adaptive Hamiltonian Monte Carlo (GRAHMC) with various friction schedules. The project implements multiple samplers and provides automated parameter tuning using gradient-based optimization.
 
 ## Key Architecture
 
 ### Sampler Implementations (samplers/)
 
-The repository contains five MCMC sampler implementations, all built with JAX:
+The repository contains four MCMC sampler implementations, all built with JAX:
 
 - **RWMH.py**: Random Walk Metropolis-Hastings baseline sampler
 - **HMC.py**: Standard Hamiltonian Monte Carlo
-- **RAHMC.py**: Randomized Adaptive HMC with constant friction
-- **GRAHMC.py**: Generalized RAHMC with multiple friction schedule functions
+- **GRAHMC.py**: Generalized Randomized Adaptive HMC with multiple friction schedule functions (includes constant schedule which is equivalent to the original RAHMC)
 - **NUTS.py**: No-U-Turn Sampler with automatic trajectory length selection
 
 All samplers follow a consistent pattern:
@@ -84,29 +83,47 @@ Comprehensive test suite for validating all samplers on standard normal distribu
 
 The tuning system optimizes sampler hyperparameters using gradient descent on sampling efficiency metrics:
 
+**Supported samplers:**
+- RWMH: Tunes `proposal_scale`
+- HMC: Tunes `step_size` and `total_time` (uses stochastic rounding for trajectory length)
+- GRAHMC: Tunes `step_size`, `total_time`, `gamma`, and `steepness` for each friction schedule
+- NUTS: Tunes `step_size` (trajectory length is automatic)
+
 **Key components:**
-- `TuningParams`: Full parameter set (step_size, num_steps, gamma, steepness) in log space
-- `DynamicParams`: Subset optimized by gradient descent (excludes num_steps)
-- `optimize_parameters()`: Optimizes dynamic params for a fixed trajectory length using Adam
-- `optimize_all_schedules()`: Grid search over trajectory lengths + GD for each schedule type
+- Parameter structures: `RWMHParams`, `HMCParams`, `GRAHMCParams`, `NUTSParams` (all in log space)
+- `tune_sampler()`: Dispatcher function that routes to appropriate tuning function
+- `tune_rwmh()`, `tune_hmc()`, `tune_grahmc()`, `tune_nuts()`: Individual tuning functions
+- `optimize_parameters()`: Core optimization loop using Adam with convergence detection
 
 **Objective function:**
 - Maximizes proposal-level ESJD (Expected Squared Jump Distance)
-- Includes acceptance rate penalties to maintain target acceptance (0.65)
+- Includes acceptance rate penalties to maintain target acceptance (0.234 for RWMH, 0.65 for others)
 - Uses variance reduction via multiple independent runs per evaluation
 - All computations are JIT-compiled and differentiable through JAX
+- **Straight-through estimator for trajectory length**: Uses hard thresholds `(i < actual_steps)` in forward pass (maintains detailed balance), soft sigmoid gradients in backward pass (allows gradient flow through continuous `actual_steps = T/ε`)
+
+**Convergence detection:**
+- Waits `min_iter` iterations before checking convergence
+- Checks relative change in best metric < `tolerance`
+- Requires `patience` consecutive converged iterations to stop early
 
 **Usage pattern:**
 ```python
-results = optimize_all_schedules(
-    key, log_prob_fn, init_position,
-    schedule_types=['constant', 'tanh', 'sigmoid', 'linear', 'sine'],
-    L_grid=[30, 40, 50, 60],  # trajectory lengths to try
-    n_optimization_steps=50,
-)
+# Tune RWMH
+params = tune_sampler('rwmh', key, log_prob_fn, init_position)
+
+# Tune GRAHMC with tanh schedule
+params = tune_sampler('grahmc', key, log_prob_fn, init_position, schedule='tanh')
+
+# Tune all GRAHMC schedules
+results = tune_sampler('grahmc', key, log_prob_fn, init_position, schedule='all')
+
+# Command line
+python tuning.py --sampler rwmh --dim 10
+python tuning.py --sampler grahmc --schedule tanh --dim 10
 ```
 
-Returns dict mapping schedule types to `(best_params, optimization_history)`.
+Returns tuned parameters (type depends on sampler).
 
 ### JAX Integration
 
@@ -145,11 +162,30 @@ python test_samplers.py --sampler grahmc --schedule sine --dim 10 --chains 4 --t
 python debug_nuts.py
 ```
 
-### Running the main analysis
+### Tuning sampler parameters
 ```bash
-# Execute the tuning script (performs full parameter optimization)
-python tuning.py
+# Tune individual samplers
+python tuning.py --sampler rwmh --dim 10
+python tuning.py --sampler hmc --dim 10
+python tuning.py --sampler nuts --dim 10
 
+# Tune GRAHMC with specific friction schedule
+python tuning.py --sampler grahmc --schedule constant --dim 10
+python tuning.py --sampler grahmc --schedule tanh --dim 10
+python tuning.py --sampler grahmc --schedule sigmoid --dim 10
+
+# Tune all GRAHMC schedules at once
+python tuning.py --sampler grahmc --schedule all --dim 10
+
+# Run full GRAHMC analysis (legacy mode with visualization)
+python tuning.py --full-analysis
+
+# Customize tuning parameters
+python tuning.py --sampler hmc --dim 20 --max-iter 200 --chains 8
+```
+
+### Running notebooks
+```bash
 # Run the Jupyter notebook for benchmarking
 jupyter notebook run.ipynb
 ```
@@ -208,14 +244,13 @@ Uses Geyer's initial positive sequence estimator (`estimate_ess_geyer()`):
 ```
 .
 ├── samplers/           # Core MCMC implementations
-│   ├── GRAHMC.py      # Main GRAHMC with friction schedules
-│   ├── RAHMC.py       # Basic RAHMC
-│   ├── HMC.py         # Standard HMC
-│   ├── NUTS.py        # No-U-Turn Sampler (NUTS)
+│   ├── GRAHMC.py      # Generalized RAHMC with friction schedules (constant, tanh, sigmoid, linear, sine)
+│   ├── HMC.py         # Standard Hamiltonian Monte Carlo
+│   ├── NUTS.py        # No-U-Turn Sampler (automatic trajectory length)
 │   └── RWMH.py        # Random Walk Metropolis-Hastings
 ├── test_samplers.py   # Comprehensive test suite with dual averaging
 ├── debug_nuts.py      # Quick NUTS debugging script
-├── tuning.py          # Automated parameter optimization (ESJD-based)
+├── tuning.py          # Automated parameter optimization (gradient-based ESJD)
 ├── run.ipynb          # Benchmarking and comparison notebook
 └── requirements.txt   # Python dependencies
 ```
