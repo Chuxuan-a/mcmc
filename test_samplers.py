@@ -18,8 +18,14 @@ import arviz as az
 # Import samplers
 from samplers.RWMH import rwMH_run
 from samplers.HMC import hmc_run
-# from samplers.RAHMC import rahmc_run
-# from samplers.GRAHMC import grahmc_run
+from samplers.GRAHMC import (
+    rahmc_run,
+    constant_schedule,
+    tanh_schedule,
+    sigmoid_schedule,
+    linear_schedule,
+    sine_schedule,
+)
 
 
 def standard_normal_log_prob(x: jnp.ndarray) -> jnp.ndarray:
@@ -112,6 +118,431 @@ def dual_averaging_tune_rwmh(
     final_scale = float(jnp.exp(log_scale_bar))
     print(f"  Reached max iterations ({max_iter}): scale={final_scale:.4f}")
     return final_scale
+
+
+def dual_averaging_tune_grahmc_step_size(
+    key: jnp.ndarray,
+    log_prob_fn,
+    init_position: jnp.ndarray,
+    num_steps: int,
+    gamma: float,
+    steepness: float,
+    friction_schedule,
+    target_accept: float = 0.65,
+    tolerance: float = 0.01,
+    max_iter: int = 500,
+    min_iter: int = 50,
+    patience: int = 10,
+) -> float:
+    """Tune GRAHMC step size via dual averaging (gamma, steepness fixed).
+
+    Args:
+        key: JAX random key
+        log_prob_fn: Target log probability function
+        init_position: Initial positions (n_chains, n_dim)
+        num_steps: Number of leapfrog steps (fixed)
+        gamma: Friction amplitude (fixed)
+        steepness: Transition sharpness parameter (fixed, can be None)
+        friction_schedule: Friction schedule function
+        target_accept: Target acceptance rate
+        tolerance: Convergence tolerance
+        max_iter: Maximum tuning iterations
+        min_iter: Minimum iterations before checking convergence
+        patience: Consecutive converged iterations required
+
+    Returns:
+        Tuned step size
+    """
+    # Dual averaging parameters (from Stan)
+    gamma_da = 0.05  # renamed to avoid confusion with friction gamma
+    t0 = 10.0
+    kappa = 0.75
+
+    # Initialize with d-dependent starting point
+    d = init_position.shape[-1]
+    initial_step_size = 0.5 / jnp.sqrt(d)  # Scale inversely with sqrt(dim)
+    log_step_size = jnp.log(initial_step_size)
+    mu = log_step_size  # Set target around initial
+    log_step_size_bar = 0.0
+    H_bar = 0.0
+
+    step_size = jnp.exp(log_step_size)
+    prev_step_size_bar = float(step_size)
+
+    # Run tuning iterations until convergence
+    n_samples_per_tune = 20  # More samples for better acceptance estimate
+    converged_count = 0
+
+    for m in range(1, max_iter + 1):
+        key, subkey = random.split(key)
+        _, _, accept_rate, _ = rahmc_run(
+            subkey, log_prob_fn, init_position,
+            step_size=float(step_size), num_steps=num_steps,
+            gamma=gamma, steepness=steepness,
+            num_samples=n_samples_per_tune, burn_in=0,
+            friction_schedule=friction_schedule
+        )
+        alpha = float(jnp.mean(accept_rate))
+
+        # Dual averaging update
+        eta_m = 1.0 / (m + t0)
+        H_bar = (1 - eta_m) * H_bar + eta_m * (target_accept - alpha)
+        log_step_size = mu - (jnp.sqrt(m) / gamma_da) * H_bar
+        m_kappa = m ** (-kappa)
+        log_step_size_bar = m_kappa * log_step_size + (1 - m_kappa) * log_step_size_bar
+
+        step_size = jnp.exp(log_step_size)
+        current_step_size_bar = float(jnp.exp(log_step_size_bar))
+
+        # Check convergence after minimum iterations
+        if m >= min_iter:
+            relative_change = abs(current_step_size_bar - prev_step_size_bar) / (abs(prev_step_size_bar) + 1e-10)
+            if relative_change < tolerance:
+                converged_count += 1
+            else:
+                converged_count = 0
+
+            if converged_count >= patience:
+                print(f"  Converged after {m} iterations: step_size={current_step_size_bar:.4f}, accept={alpha:.3f}")
+                return current_step_size_bar
+
+        prev_step_size_bar = current_step_size_bar
+
+        if m % 200 == 0:
+            print(f"  Tuning iteration {m}: step_size={current_step_size_bar:.4f}, accept={alpha:.3f}")
+
+    final_step_size = float(jnp.exp(log_step_size_bar))
+    print(f"  Reached max iterations ({max_iter}): step_size={final_step_size:.4f}")
+    return final_step_size
+
+
+def dual_averaging_tune_grahmc_steepness(
+    key: jnp.ndarray,
+    log_prob_fn,
+    init_position: jnp.ndarray,
+    num_steps: int,
+    step_size: float,
+    gamma: float,
+    friction_schedule,
+    target_accept: float = 0.65,
+    tolerance: float = 0.01,
+    max_iter: int = 500,
+    min_iter: int = 50,
+    patience: int = 10,
+) -> float:
+    """Tune GRAHMC steepness parameter via dual averaging (step_size, gamma fixed).
+
+    Args:
+        key: JAX random key
+        log_prob_fn: Target log probability function
+        init_position: Initial positions (n_chains, n_dim)
+        num_steps: Number of leapfrog steps (fixed)
+        step_size: Integration step size (fixed)
+        gamma: Friction amplitude (fixed)
+        friction_schedule: Friction schedule function
+        target_accept: Target acceptance rate
+        tolerance: Convergence tolerance
+        max_iter: Maximum tuning iterations
+        min_iter: Minimum iterations before checking convergence
+        patience: Consecutive converged iterations required
+
+    Returns:
+        Tuned steepness parameter
+    """
+    # Dual averaging parameters (from Stan)
+    gamma_da = 0.05
+    t0 = 10.0
+    kappa = 0.75
+
+    # Initialize steepness around 5.0 for tanh, 10.0 for sigmoid
+    # Use a reasonable default
+    initial_steepness = 5.0
+    log_steepness = jnp.log(initial_steepness)
+    mu = log_steepness
+    log_steepness_bar = 0.0
+    H_bar = 0.0
+
+    steepness = jnp.exp(log_steepness)
+    prev_steepness_bar = float(steepness)
+
+    # Run tuning iterations until convergence
+    n_samples_per_tune = 20
+    converged_count = 0
+
+    for m in range(1, max_iter + 1):
+        key, subkey = random.split(key)
+        _, _, accept_rate, _ = rahmc_run(
+            subkey, log_prob_fn, init_position,
+            step_size=step_size, num_steps=num_steps,
+            gamma=gamma, steepness=float(steepness),
+            num_samples=n_samples_per_tune, burn_in=0,
+            friction_schedule=friction_schedule
+        )
+        alpha = float(jnp.mean(accept_rate))
+
+        # Dual averaging update
+        eta_m = 1.0 / (m + t0)
+        H_bar = (1 - eta_m) * H_bar + eta_m * (target_accept - alpha)
+        log_steepness = mu - (jnp.sqrt(m) / gamma_da) * H_bar
+        m_kappa = m ** (-kappa)
+        log_steepness_bar = m_kappa * log_steepness + (1 - m_kappa) * log_steepness_bar
+
+        steepness = jnp.exp(log_steepness)
+        current_steepness_bar = float(jnp.exp(log_steepness_bar))
+
+        # Check convergence after minimum iterations
+        if m >= min_iter:
+            relative_change = abs(current_steepness_bar - prev_steepness_bar) / (abs(prev_steepness_bar) + 1e-10)
+            if relative_change < tolerance:
+                converged_count += 1
+            else:
+                converged_count = 0
+
+            if converged_count >= patience:
+                print(f"  Converged after {m} iterations: steepness={current_steepness_bar:.4f}, accept={alpha:.3f}")
+                return current_steepness_bar
+
+        prev_steepness_bar = current_steepness_bar
+
+        if m % 200 == 0:
+            print(f"  Tuning iteration {m}: steepness={current_steepness_bar:.4f}, accept={alpha:.3f}")
+
+    final_steepness = float(jnp.exp(log_steepness_bar))
+    print(f"  Reached max iterations ({max_iter}): steepness={final_steepness:.4f}")
+    return final_steepness
+
+
+def dual_averaging_tune_grahmc_gamma(
+    key: jnp.ndarray,
+    log_prob_fn,
+    init_position: jnp.ndarray,
+    num_steps: int,
+    step_size: float,
+    steepness: float,
+    friction_schedule,
+    target_accept: float = 0.65,
+    tolerance: float = 0.01,
+    max_iter: int = 500,
+    min_iter: int = 50,
+    patience: int = 10,
+) -> float:
+    """Tune GRAHMC gamma (friction amplitude) via dual averaging (step_size, steepness fixed).
+
+    Args:
+        key: JAX random key
+        log_prob_fn: Target log probability function
+        init_position: Initial positions (n_chains, n_dim)
+        num_steps: Number of leapfrog steps (fixed)
+        step_size: Integration step size (fixed)
+        steepness: Transition sharpness parameter (fixed, can be None)
+        friction_schedule: Friction schedule function
+        target_accept: Target acceptance rate
+        tolerance: Convergence tolerance
+        max_iter: Maximum tuning iterations
+        min_iter: Minimum iterations before checking convergence
+        patience: Consecutive converged iterations required
+
+    Returns:
+        Tuned gamma parameter
+    """
+    # Dual averaging parameters (from Stan)
+    gamma_da = 0.05
+    t0 = 10.0
+    kappa = 0.75
+
+    # Initialize gamma around 0.5 (reasonable for many problems)
+    initial_gamma = 0.5
+    log_gamma = jnp.log(initial_gamma)
+    mu = log_gamma  # Target around initial
+    log_gamma_bar = 0.0
+    H_bar = 0.0
+
+    gamma = jnp.exp(log_gamma)
+    prev_gamma_bar = float(gamma)
+
+    # Run tuning iterations until convergence
+    n_samples_per_tune = 20
+    converged_count = 0
+
+    for m in range(1, max_iter + 1):
+        key, subkey = random.split(key)
+        _, _, accept_rate, _ = rahmc_run(
+            subkey, log_prob_fn, init_position,
+            step_size=step_size, num_steps=num_steps,
+            gamma=float(gamma), steepness=steepness,
+            num_samples=n_samples_per_tune, burn_in=0,
+            friction_schedule=friction_schedule
+        )
+        alpha = float(jnp.mean(accept_rate))
+
+        # Dual averaging update
+        eta_m = 1.0 / (m + t0)
+        H_bar = (1 - eta_m) * H_bar + eta_m * (target_accept - alpha)
+        log_gamma = mu - (jnp.sqrt(m) / gamma_da) * H_bar
+        m_kappa = m ** (-kappa)
+        log_gamma_bar = m_kappa * log_gamma + (1 - m_kappa) * log_gamma_bar
+
+        gamma = jnp.exp(log_gamma)
+        current_gamma_bar = float(jnp.exp(log_gamma_bar))
+
+        # Check convergence after minimum iterations
+        if m >= min_iter:
+            relative_change = abs(current_gamma_bar - prev_gamma_bar) / (abs(prev_gamma_bar) + 1e-10)
+            if relative_change < tolerance:
+                converged_count += 1
+            else:
+                converged_count = 0
+
+            if converged_count >= patience:
+                print(f"  Converged after {m} iterations: gamma={current_gamma_bar:.4f}, accept={alpha:.3f}")
+                return current_gamma_bar
+
+        prev_gamma_bar = current_gamma_bar
+
+        if m % 200 == 0:
+            print(f"  Tuning iteration {m}: gamma={current_gamma_bar:.4f}, accept={alpha:.3f}")
+
+    final_gamma = float(jnp.exp(log_gamma_bar))
+    print(f"  Reached max iterations ({max_iter}): gamma={final_gamma:.4f}")
+    return final_gamma
+
+
+def dual_averaging_tune_grahmc(
+    key: jnp.ndarray,
+    log_prob_fn,
+    init_position: jnp.ndarray,
+    num_steps: int = 20,
+    friction_schedule = constant_schedule,
+    target_accept: float = 0.65,
+    tolerance: float = 0.01,
+    max_cycles: int = 10,
+    min_cycles: int = 2,
+    patience: int = 2,
+) -> Tuple[float, float] | Tuple[float, float, float]:
+    """Tune GRAHMC parameters via coordinate-wise dual averaging until convergence.
+
+    For schedules with steepness (tanh, sigmoid): tunes (step_size, gamma, steepness)
+    For schedules without steepness (constant, linear, sine): tunes (step_size, gamma)
+
+    Args:
+        key: JAX random key
+        log_prob_fn: Target log probability function
+        init_position: Initial positions (n_chains, n_dim)
+        num_steps: Number of leapfrog steps (fixed, not tuned)
+        friction_schedule: Friction schedule function
+        target_accept: Target acceptance rate
+        tolerance: Convergence tolerance (relative change in parameters)
+        max_cycles: Maximum number of alternating cycles
+        min_cycles: Minimum cycles before checking convergence
+        patience: Number of consecutive converged cycles required
+
+    Returns:
+        If schedule uses steepness: (step_size, gamma, steepness)
+        Otherwise: (step_size, gamma)
+    """
+    # Check which schedule type we're using
+    schedule_uses_steepness = friction_schedule in [tanh_schedule, sigmoid_schedule]
+
+    # Initialize parameters
+    gamma = 0.5
+    d = init_position.shape[-1]
+    step_size = 0.5 / jnp.sqrt(d)
+    steepness = 5.0 if friction_schedule == tanh_schedule else 10.0 if friction_schedule == sigmoid_schedule else None
+
+    if schedule_uses_steepness:
+        print(f"  Starting coordinate-wise tuning (will iterate until convergence)...")
+        print(f"  Initial: step_size={step_size:.4f}, gamma={gamma:.4f}, steepness={steepness:.4f}")
+    else:
+        print(f"  Starting coordinate-wise tuning (will iterate until convergence)...")
+        print(f"  Initial: step_size={step_size:.4f}, gamma={gamma:.4f}")
+
+    prev_step_size = step_size
+    prev_gamma = gamma
+    prev_steepness = steepness
+    converged_count = 0
+
+    for cycle in range(max_cycles):
+        print(f"\n  --- Cycle {cycle + 1} ---")
+
+        # Tune step_size with fixed gamma and steepness
+        if schedule_uses_steepness:
+            print(f"  Tuning step_size (gamma={gamma:.4f}, steepness={steepness:.4f} fixed)...")
+        else:
+            print(f"  Tuning step_size (gamma={gamma:.4f} fixed)...")
+        key, subkey = random.split(key)
+        step_size = dual_averaging_tune_grahmc_step_size(
+            subkey, log_prob_fn, init_position,
+            num_steps=num_steps, gamma=gamma,
+            steepness=steepness, friction_schedule=friction_schedule,
+            target_accept=target_accept
+        )
+
+        # Tune gamma with fixed step_size and steepness
+        if schedule_uses_steepness:
+            print(f"  Tuning gamma (step_size={step_size:.4f}, steepness={steepness:.4f} fixed)...")
+        else:
+            print(f"  Tuning gamma (step_size={step_size:.4f} fixed)...")
+        key, subkey = random.split(key)
+        gamma = dual_averaging_tune_grahmc_gamma(
+            subkey, log_prob_fn, init_position,
+            num_steps=num_steps, step_size=step_size,
+            steepness=steepness, friction_schedule=friction_schedule,
+            target_accept=target_accept
+        )
+
+        # Tune steepness with fixed step_size and gamma (only for tanh/sigmoid)
+        if schedule_uses_steepness:
+            print(f"  Tuning steepness (step_size={step_size:.4f}, gamma={gamma:.4f} fixed)...")
+            key, subkey = random.split(key)
+            steepness = dual_averaging_tune_grahmc_steepness(
+                subkey, log_prob_fn, init_position,
+                num_steps=num_steps, step_size=step_size,
+                gamma=gamma, friction_schedule=friction_schedule,
+                target_accept=target_accept
+            )
+
+        # Check convergence after minimum cycles
+        if cycle >= min_cycles - 1:
+            step_size_change = abs(step_size - prev_step_size) / (abs(prev_step_size) + 1e-10)
+            gamma_change = abs(gamma - prev_gamma) / (abs(prev_gamma) + 1e-10)
+
+            if schedule_uses_steepness:
+                steepness_change = abs(steepness - prev_steepness) / (abs(prev_steepness) + 1e-10)
+                print(f"  Parameter changes: step_size={step_size_change:.6f}, gamma={gamma_change:.6f}, steepness={steepness_change:.6f}")
+                all_stable = (step_size_change < tolerance and
+                            gamma_change < tolerance and
+                            steepness_change < tolerance)
+            else:
+                print(f"  Parameter changes: step_size={step_size_change:.6f}, gamma={gamma_change:.6f}")
+                all_stable = step_size_change < tolerance and gamma_change < tolerance
+
+            if all_stable:
+                converged_count += 1
+                print(f"  All parameters stable ({converged_count}/{patience})")
+            else:
+                converged_count = 0
+                print(f"  Parameters still changing, continuing...")
+
+            if converged_count >= patience:
+                print(f"\n  Converged after {cycle + 1} cycles!")
+                if schedule_uses_steepness:
+                    print(f"  Final: step_size={step_size:.4f}, gamma={gamma:.4f}, steepness={steepness:.4f}")
+                    return step_size, gamma, steepness
+                else:
+                    print(f"  Final: step_size={step_size:.4f}, gamma={gamma:.4f}")
+                    return step_size, gamma
+
+        prev_step_size = step_size
+        prev_gamma = gamma
+        prev_steepness = steepness
+
+    print(f"\n  Reached max cycles ({max_cycles})")
+    if schedule_uses_steepness:
+        print(f"  Final: step_size={step_size:.4f}, gamma={gamma:.4f}, steepness={steepness:.4f}")
+        return step_size, gamma, steepness
+    else:
+        print(f"  Final: step_size={step_size:.4f}, gamma={gamma:.4f}")
+        return step_size, gamma
 
 
 def dual_averaging_tune_hmc(
@@ -215,6 +646,7 @@ def run_sampler(
     target_ess: int = 1000,
     batch_size: int = 2000,
     max_samples: int = 50000,
+    schedule_type: str = "constant",
 ) -> Tuple[jnp.ndarray, jnp.ndarray, Dict]:
     """Run specified sampler with adaptive sampling until target ESS is reached.
 
@@ -227,6 +659,8 @@ def run_sampler(
         target_ess: Target minimum bulk ESS per dimension
         batch_size: Number of samples per batch
         max_samples: Maximum total samples to collect
+        schedule_type: Friction schedule type for GRAHMC
+                      ('constant', 'tanh', 'sigmoid', 'linear', 'sine')
 
     Returns:
         Tuple of (samples, log_probs, metadata)
@@ -265,6 +699,44 @@ def run_sampler(
         metadata["step_size"] = step_size
         metadata["num_steps"] = num_steps
         param_str = f"step_size={step_size:.4f}, L={num_steps}"
+    elif sampler in ["grahmc", "rahmc"]:
+        # Map schedule type to schedule function
+        schedule_map = {
+            "constant": constant_schedule,
+            "tanh": tanh_schedule,
+            "sigmoid": sigmoid_schedule,
+            "linear": linear_schedule,
+            "sine": sine_schedule,
+        }
+        friction_schedule = schedule_map[schedule_type]
+
+        num_steps = 20  # Fixed trajectory length
+        print(f"\nTuning parameters for {schedule_type} friction schedule via coordinate-wise dual averaging (L={num_steps} fixed)...")
+        key, tune_key = random.split(key)
+
+        # Tune parameters (returns 2 or 3 values depending on schedule)
+        tuned_params = dual_averaging_tune_grahmc(
+            tune_key, standard_normal_log_prob, init_position,
+            num_steps=num_steps, friction_schedule=friction_schedule
+        )
+
+        # Unpack based on number of returned values
+        if len(tuned_params) == 3:
+            step_size, gamma, steepness = tuned_params
+            metadata["step_size"] = step_size
+            metadata["num_steps"] = num_steps
+            metadata["gamma"] = gamma
+            metadata["steepness"] = steepness
+            metadata["schedule_type"] = schedule_type
+            param_str = f"step_size={step_size:.4f}, L={num_steps}, gamma={gamma:.4f}, steepness={steepness:.4f}"
+        else:
+            step_size, gamma = tuned_params
+            steepness = None
+            metadata["step_size"] = step_size
+            metadata["num_steps"] = num_steps
+            metadata["gamma"] = gamma
+            metadata["schedule_type"] = schedule_type
+            param_str = f"step_size={step_size:.4f}, L={num_steps}, gamma={gamma:.4f}"
     else:
         raise ValueError(f"Unknown sampler: {sampler}")
 
@@ -292,6 +764,14 @@ def run_sampler(
                 sample_key, standard_normal_log_prob, current_position,
                 step_size=step_size, num_steps=num_steps,
                 num_samples=batch_size, burn_in=0
+            )
+        elif sampler in ["grahmc", "rahmc"]:
+            samples_batch, lps_batch, accept_rate, final_state = rahmc_run(
+                sample_key, standard_normal_log_prob, current_position,
+                step_size=step_size, num_steps=num_steps,
+                gamma=gamma, steepness=steepness,
+                num_samples=batch_size, burn_in=0,
+                friction_schedule=friction_schedule
             )
 
         # Continue from where we left off
@@ -439,6 +919,13 @@ def main():
         choices=["rwmh", "hmc", "rahmc", "grahmc"],
         help="Sampler to test"
     )
+    parser.add_argument(
+        "--schedule",
+        type=str,
+        default="constant",
+        choices=["constant", "tanh", "sigmoid", "linear", "sine"],
+        help="Friction schedule for GRAHMC/RAHMC (default: constant)"
+    )
     parser.add_argument("--dim", type=int, default=10, help="Dimensionality (default: 10)")
     parser.add_argument("--chains", type=int, default=4, help="Number of chains (default: 4)")
     parser.add_argument("--tune", type=int, default=1000, help="Tuning iterations (default: 1000)")
@@ -463,6 +950,7 @@ def main():
         target_ess=args.target_ess,
         batch_size=args.batch_size,
         max_samples=args.max_samples,
+        schedule_type=args.schedule,
     )
 
     # Compute diagnostics
