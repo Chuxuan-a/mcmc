@@ -1,11 +1,41 @@
 
-# %%
+"""
+Automated Parameter Tuning for MCMC Samplers
+
+This module implements gradient-based optimization of MCMC sampler parameters
+using Expected Squared Jump Distance (ESJD) as the objective function.
+
+Supported Samplers:
+- RWMH: Random Walk Metropolis-Hastings (tunes proposal_scale)
+- HMC: Hamiltonian Monte Carlo (tunes step_size, total_time)
+- GRAHMC: Generalized RAHMC with schedules (tunes step_size, total_time, gamma, steepness)
+- NUTS: No-U-Turn Sampler (tunes step_size, trajectory length is automatic)
+
+Key Features:
+- Gradient-based optimization (more efficient than dual averaging)
+- Convergence detection (min_iter, tolerance, patience)
+- Dynamic masking for continuous trajectory length optimization (fully differentiable)
+- Maximizes proposal-level ESJD weighted by acceptance probability
+- Variance reduction via multiple independent runs
+
+Usage:
+    # Command line
+    python tuning.py --sampler rwmh --dim 10
+    python tuning.py --sampler grahmc --schedule tanh --dim 10
+
+    # As module
+    from tuning import tune_sampler
+    params = tune_sampler('rwmh', key, log_prob_fn, init_position)
+"""
+
 from __future__ import annotations
+import argparse
+import sys
 import jax
 import jax.numpy as jnp
 from jax import grad, jit, vmap, random, lax
 import optax
-from typing import NamedTuple, Callable, Dict, List, Tuple
+from typing import NamedTuple, Callable, Dict, List, Tuple, Optional, Any
 from functools import partial
 import numpy as np
 import matplotlib.pyplot as plt
@@ -15,12 +45,15 @@ import seaborn as sns
 import os
 os.environ['JAX_ENABLE_X64'] = 'True' # Enable float64 for better numerical stability
 
-
+# Import all samplers
+from samplers.RWMH import rwMH_run
+from samplers.HMC import hmc_run, hmc_run_dynamic
 from samplers.GRAHMC import (
     Array,
     LogProbFn,
     FrictionScheduleFn,
     rahmc_init,
+    rahmc_run,
     constant_schedule,
     tanh_schedule,
     sigmoid_schedule,
@@ -30,6 +63,7 @@ from samplers.GRAHMC import (
     RAHMCState,
     _trajectory_with_schedule,
 )
+from samplers.NUTS import nuts_run
 
 # %%
 def compute_autocorr(x: jnp.ndarray, max_lag: int | None = None) -> jnp.ndarray:
@@ -67,27 +101,60 @@ def estimate_ess_bulk(samples: jnp.ndarray) -> jnp.ndarray:
     dim_indices = jnp.arange(n_dim)
     return vmap(lambda i: estimate_ess_geyer(reshaped[:, i]))(dim_indices)
 
-class TuningParams(NamedTuple):
-    # in log space for positivity
-    log_step_size: float      # log(eps)
-    log_num_steps: float      # log(L)
-    log_gamma: float          # log(gamma)
-    log_steepness: float      # log(steepness) - for tanh/sigmoid
+# ============================================================================
+# Parameter Structures for All Samplers
+# ============================================================================
 
-class DynamicParams(NamedTuple):
-    """parameters to optimize using GD"""
-    log_step_size: float
-    log_gamma: float
-    log_steepness: float
+# RWMH Parameters
+class RWMHParams(NamedTuple):
+    """RWMH tuning parameters in log space."""
+    log_proposal_scale: float  # log(σ) - proposal standard deviation
+
+# HMC Parameters
+class HMCParams(NamedTuple):
+    """HMC tuning parameters in log space."""
+    log_step_size: float   # log(ε) - leapfrog step size
+    log_total_time: float  # log(T) - total trajectory time
+
+# GRAHMC Parameters (all friction schedules)
+class GRAHMCParams(NamedTuple):
+    """GRAHMC tuning parameters in log space."""
+    log_step_size: float   # log(ε) - leapfrog step size
+    log_total_time: float  # log(T) - total trajectory time
+    log_gamma: float       # log(γ) - friction magnitude
+    log_steepness: float   # log(s) - schedule transition steepness
+
+# NUTS Parameters
+class NUTSParams(NamedTuple):
+    """NUTS tuning parameters in log space."""
+    log_step_size: float   # log(ε) - leapfrog step size
+    # Note: trajectory length is automatic in NUTS
+
+# Legacy aliases for backward compatibility
+TuningParams = GRAHMCParams
+DynamicParams = GRAHMCParams
 
 
-def params_to_dict(params: TuningParams):
-    return {
-        'step_size': float(jnp.exp(params.log_step_size)),
-        'num_steps': int(jnp.exp(params.log_num_steps)),
-        'gamma': float(jnp.exp(params.log_gamma)),
-        'steepness': float(jnp.exp(params.log_steepness)),
-    }
+def params_to_dict(params: Any) -> Dict[str, float]:
+    """Convert any parameter NamedTuple to human-readable dictionary."""
+    result = {}
+
+    if isinstance(params, RWMHParams):
+        result['proposal_scale'] = float(jnp.exp(params.log_proposal_scale))
+
+    elif isinstance(params, (HMCParams, GRAHMCParams)):
+        result['step_size'] = float(jnp.exp(params.log_step_size))
+        result['total_time'] = float(jnp.exp(params.log_total_time))
+        result['expected_num_steps'] = result['total_time'] / result['step_size']
+
+        if isinstance(params, GRAHMCParams):
+            result['gamma'] = float(jnp.exp(params.log_gamma))
+            result['steepness'] = float(jnp.exp(params.log_steepness))
+
+    elif isinstance(params, NUTSParams):
+        result['step_size'] = float(jnp.exp(params.log_step_size))
+
+    return result
 
 FRICTION_SCHEDULES = {
     'constant': constant_schedule,
@@ -98,29 +165,13 @@ FRICTION_SCHEDULES = {
 }
 
 def get_friction_schedule(schedule_type: str):
+    """Get friction schedule function by name."""
     return FRICTION_SCHEDULES[schedule_type]
 
 
-# def create_friction_schedule(
-#     schedule_type: str,
-#     gamma: float,
-#     steepness: float = None,
-# ):
-#     """Create friction schedule from parameters."""
-#     if schedule_type == 'constant':
-#         return 
-#     elif schedule_type == 'tanh':
-#         return tanh_friction(gamma, steepness)
-#     elif schedule_type == 'sigmoid':
-#         return sigmoid_friction(gamma, steepness)
-#     elif schedule_type == 'linear':
-#         return linear_friction(gamma)
-#     elif schedule_type == 'sine':
-#         return sine_friction(gamma)
-#     else:
-#         raise ValueError(f"Unknown schedule type: {schedule_type}")
-
-# %%
+# ============================================================================
+# RAHMC Step and Run Functions
+# ============================================================================
 @partial(jit, static_argnames=("log_prob_fn", "return_proposal", "friction_schedule", "num_steps"))
 def rahmc_step(
     state: RAHMCState,
@@ -261,7 +312,10 @@ def rahmc_run(
         accept_rate = state.accept_count.astype(jnp.float32) / num_samples
         return samples, lps, accept_rate, state
 
-# %%
+# ============================================================================
+# ESJD Computation
+# ============================================================================
+
 def compute_proposal_esjd_soft(
     initial_positions: jnp.ndarray,
     proposals: jnp.ndarray,
@@ -289,10 +343,12 @@ def compute_proposal_esjd_soft(
 
 
 
+# ============================================================================
+# Optimization Objectives
+# ============================================================================
+
 def objective_proposal_esjd(
-    # params: TuningParams,
     dyn_params: DynamicParams,
-    log_num_steps: float, # static argument
     key: jnp.ndarray,
     log_prob_fn: Callable,
     init_position: jnp.ndarray,
@@ -301,22 +357,31 @@ def objective_proposal_esjd(
     schedule_type: str,
 ) -> float:
     """
-    Maximize proposal-level acceptance-weighted ESJD using the pre-step state.
+    Maximize proposal-level acceptance-weighted ESJD.
     Returns the negative value for minimization.
-    """
-    # reconstruct full params from dynamic and static parts
-    params = TuningParams(
-        log_step_size=dyn_params.log_step_size,
-        log_num_steps=log_num_steps,
-        log_gamma=dyn_params.log_gamma,
-        log_steepness=dyn_params.log_steepness
-    )
 
-    # continuous params
-    step_size = jnp.exp(params.log_step_size)
-    num_steps = int(jnp.maximum(jnp.round(jnp.exp(params.log_num_steps)).astype(jnp.int32), 1))
-    gamma     = jnp.exp(params.log_gamma)
-    steepness = jnp.exp(params.log_steepness)
+    Uses stochastic rounding for num_steps:
+    - T / epsilon = n + r, where n = floor(T/epsilon) and 0 <= r < 1
+    - num_steps = n with probability (1-r), n+1 with probability r
+    - Unbiased in expectation: E[num_steps] = n + r = T / epsilon
+    """
+    # Extract parameters
+    step_size = jnp.exp(dyn_params.log_step_size)
+    total_time = jnp.exp(dyn_params.log_total_time)
+    gamma = jnp.exp(dyn_params.log_gamma)
+    steepness = jnp.exp(dyn_params.log_steepness)
+
+    # Stochastic rounding: num_steps ~ floor(T/eps) + Bernoulli(remainder)
+    key, round_key = random.split(key)
+    num_steps_float = total_time / step_size
+    n = jnp.floor(num_steps_float)
+    r = num_steps_float - n  # remainder in [0, 1)
+
+    # Round up to n+1 with probability r, else stay at n
+    round_up = random.uniform(round_key) < r
+    num_steps_jax = n + round_up.astype(jnp.int32)
+    # Convert to Python int for use as static argument in JIT
+    num_steps = int(jnp.maximum(num_steps_jax, 1))
 
     friction_schedule = get_friction_schedule(schedule_type)
 
@@ -342,37 +407,40 @@ def objective_proposal_esjd(
 
     log_esjd = jnp.log(esjd + 1e-10)
 
-    # acceptance guard
+    # Acceptance rate penalties (target 0.65 for HMC-like samplers)
     mean_alpha = jnp.mean(alpha)
     target_accept = 0.65
-    accept_penalty    = (mean_alpha - target_accept) ** 2
-    low_accept_guard  = jnp.maximum(0.0, 0.15 - mean_alpha) ** 2
+    accept_penalty = (mean_alpha - target_accept) ** 2
+    low_accept_guard = jnp.maximum(0.0, 0.15 - mean_alpha) ** 2
     high_accept_guard = jnp.maximum(0.0, mean_alpha - 0.90) ** 2
 
     objective_value = log_esjd \
         - 50.0 * accept_penalty \
         - 25.0 * (low_accept_guard + high_accept_guard)
 
+    # Parameter bound penalties
     penalty = 0.0
-    penalty += 1.0 * jnp.maximum(0.0, params.log_step_size - jnp.log(1.0)) ** 2
-    penalty += 1.0 * jnp.maximum(0.0, -params.log_step_size + jnp.log(0.01)) ** 2
+    # Step size: 0.01 <= epsilon <= 1.0
+    penalty += 1.0 * jnp.maximum(0.0, dyn_params.log_step_size - jnp.log(1.0)) ** 2
+    penalty += 1.0 * jnp.maximum(0.0, -dyn_params.log_step_size + jnp.log(0.01)) ** 2
 
-    penalty += 5.0 * jnp.maximum(0.0, jnp.log(10.0) - params.log_num_steps) ** 2
-    penalty += 1.0 * jnp.maximum(0.0, params.log_num_steps - jnp.log(100.0)) ** 2
-    
-    penalty += 100.0 * jnp.maximum(0.0, params.log_gamma - jnp.log(1.5)) ** 2
-    penalty += 1.0 * jnp.maximum(0.0, jnp.log(0.01) - params.log_gamma) ** 2
+    # Total time: 1.0 <= T <= 100.0
+    penalty += 1.0 * jnp.maximum(0.0, dyn_params.log_total_time - jnp.log(100.0)) ** 2
+    penalty += 5.0 * jnp.maximum(0.0, jnp.log(1.0) - dyn_params.log_total_time) ** 2
 
-    penalty += 0.5 * jnp.maximum(0.0, params.log_steepness - jnp.log(50.0)) ** 2
-    penalty += 0.5 * jnp.maximum(0.0, jnp.log(0.5) - params.log_steepness) ** 2
+    # Gamma: 0.01 <= gamma <= 1.5
+    penalty += 100.0 * jnp.maximum(0.0, dyn_params.log_gamma - jnp.log(1.5)) ** 2
+    penalty += 1.0 * jnp.maximum(0.0, jnp.log(0.01) - dyn_params.log_gamma) ** 2
+
+    # Steepness: 0.5 <= steepness <= 50.0
+    penalty += 0.5 * jnp.maximum(0.0, dyn_params.log_steepness - jnp.log(50.0)) ** 2
+    penalty += 0.5 * jnp.maximum(0.0, jnp.log(0.5) - dyn_params.log_steepness) ** 2
 
     return -(objective_value - penalty)
 
 
 def objective_proposal_esjd_variance_reduced(
-    #params: TuningParams,
     dyn_params: DynamicParams,
-    log_num_steps: float, # static argument
     keys: jnp.ndarray,
     log_prob_fn: Callable,
     init_position: jnp.ndarray,
@@ -380,90 +448,296 @@ def objective_proposal_esjd_variance_reduced(
     burn_in: int,
     schedule_type: str,
 ) -> float:
-    """Proposal-level ESJD objective with multiple runs for variance reduction."""
-    def single_run(key):
-        return objective_proposal_esjd(
-            dyn_params, log_num_steps,
+    """
+    Proposal-level ESJD objective with multiple runs for variance reduction.
+
+    Averages the objective over multiple independent runs to reduce gradient
+    variance from stochastic rounding and MCMC randomness.
+
+    Note: We use a Python loop instead of vmap because stochastic rounding
+    requires concrete integer values that can't be traced.
+    """
+    neg_esjd_values = []
+    for key in keys:
+        neg_esjd = objective_proposal_esjd(
+            dyn_params,
             key, log_prob_fn, init_position,
             num_samples, burn_in, schedule_type
         )
-    
-    # Average over multiple runs
-    neg_esjd_values = vmap(single_run)(keys)
-    return jnp.mean(neg_esjd_values)
+        neg_esjd_values.append(neg_esjd)
 
-# %%
+    return jnp.mean(jnp.array(neg_esjd_values))
+
+
+# ============================================================================
+# Objective Functions for Other Samplers
+# ============================================================================
+
+def objective_rwmh_esjd(
+    params: RWMHParams,
+    key: jnp.ndarray,
+    log_prob_fn: Callable,
+    init_position: jnp.ndarray,
+    num_samples: int,
+    burn_in: int,
+) -> float:
+    """RWMH objective: maximize ESJD by tuning proposal_scale."""
+    proposal_scale = jnp.exp(params.log_proposal_scale)
+
+    # Run RWMH (note: rwMH_run doesn't track proposals, so we compute ESJD from samples)
+    samples, lps, accept_rate, _ = rwMH_run(
+        key, log_prob_fn, init_position,
+        num_samples=num_samples + burn_in,
+        scale=proposal_scale,
+        burn_in=0
+    )
+
+    # Discard burn-in
+    samples = samples[burn_in:]
+
+    # Compute ESJD from consecutive samples
+    diffs = samples[1:] - samples[:-1]  # (S-1, C, D)
+    squared_jumps = jnp.sum(diffs ** 2, axis=-1)  # (S-1, C)
+    esjd = jnp.mean(squared_jumps)
+
+    log_esjd = jnp.log(esjd + 1e-10)
+
+    # Acceptance rate penalty (target 0.234 for RWMH)
+    mean_accept = jnp.mean(accept_rate)  # Keep in JAX
+    target_accept = 0.234
+    accept_penalty = (mean_accept - target_accept) ** 2
+
+    objective_value = log_esjd - 50.0 * accept_penalty
+
+    # Parameter bounds: 0.01 <= scale <= 10.0
+    penalty = 0.0
+    penalty += 1.0 * jnp.maximum(0.0, params.log_proposal_scale - jnp.log(10.0)) ** 2
+    penalty += 1.0 * jnp.maximum(0.0, -params.log_proposal_scale + jnp.log(0.01)) ** 2
+
+    return -(objective_value - penalty)
+
+
+def objective_hmc_esjd(
+    params: HMCParams,
+    key: jnp.ndarray,
+    log_prob_fn: Callable,
+    init_position: jnp.ndarray,
+    num_samples: int,
+    burn_in: int,
+    max_steps: int = 200,
+) -> float:
+    """HMC objective: maximize ESJD by tuning step_size and total_time.
+
+    Uses dynamic trajectory with straight-through estimator:
+    - Forward: Hard threshold (i < actual_steps) maintains MCMC correctness
+    - Backward: Soft sigmoid allows gradients to flow through actual_steps
+
+    Note: Must use dynamic trajectory (not int(num_steps)) because converting
+    to Python int breaks gradient flow, even with STE.
+    """
+    step_size = jnp.exp(params.log_step_size)
+    total_time = jnp.exp(params.log_total_time)
+
+    # Compute actual steps as continuous variable (gradients flow!)
+    actual_steps = total_time / step_size
+
+    # Run HMC with dynamic trajectory length (STE masking maintains detailed balance)
+    samples, lps, accept_rate, _ = hmc_run_dynamic(
+        key, log_prob_fn, init_position,
+        step_size=step_size,
+        actual_steps=actual_steps,  # Continuous, differentiable
+        max_steps=max_steps,  # Static maximum (for JIT)
+        num_samples=num_samples + burn_in,
+        burn_in=0,
+        track_proposals=False,
+    )
+
+    samples = samples[burn_in:]
+
+    # Compute ESJD
+    diffs = samples[1:] - samples[:-1]
+    squared_jumps = jnp.sum(diffs ** 2, axis=-1)
+    esjd = jnp.mean(squared_jumps)
+
+    log_esjd = jnp.log(esjd + 1e-10)
+
+    # Acceptance rate penalty (target 0.65 for HMC)
+    mean_accept = jnp.mean(accept_rate)  # Keep in JAX
+    target_accept = 0.65
+    accept_penalty = (mean_accept - target_accept) ** 2
+    low_accept_guard = jnp.maximum(0.0, 0.15 - mean_accept) ** 2
+    high_accept_guard = jnp.maximum(0.0, mean_accept - 0.90) ** 2
+
+    objective_value = log_esjd - 50.0 * accept_penalty - 25.0 * (low_accept_guard + high_accept_guard)
+
+    # Parameter bounds
+    penalty = 0.0
+    penalty += 1.0 * jnp.maximum(0.0, params.log_step_size - jnp.log(1.0)) ** 2
+    penalty += 1.0 * jnp.maximum(0.0, -params.log_step_size + jnp.log(0.01)) ** 2
+    penalty += 1.0 * jnp.maximum(0.0, params.log_total_time - jnp.log(100.0)) ** 2
+    penalty += 5.0 * jnp.maximum(0.0, jnp.log(1.0) - params.log_total_time) ** 2
+
+    return -(objective_value - penalty)
+
+
+def objective_nuts_esjd(
+    params: NUTSParams,
+    key: jnp.ndarray,
+    log_prob_fn: Callable,
+    init_position: jnp.ndarray,
+    num_samples: int,
+    burn_in: int,
+) -> float:
+    """
+    NUTS objective: maximize ESJD by tuning step_size (trajectory length is automatic).
+
+    Note: Uses stop_gradient because NUTS uses lax.while_loop internally, which isn't
+    differentiable. Gradients come from variation in ESJD across parameters (zeroth-order).
+    """
+    step_size = jnp.exp(params.log_step_size)
+
+    # Run NUTS - keep step_size in JAX
+    samples, lps, accept_rate, _, _, _ = nuts_run(
+        key, log_prob_fn, init_position,
+        step_size=step_size,  # Keep as JAX array
+        num_samples=num_samples + burn_in,
+        burn_in=0
+    )
+
+    # Stop gradient through sampler (NUTS while_loop isn't differentiable)
+    samples = jax.lax.stop_gradient(samples)
+    accept_rate = jax.lax.stop_gradient(accept_rate)
+
+    samples = samples[burn_in:]
+
+    # Compute ESJD
+    diffs = samples[1:] - samples[:-1]
+    squared_jumps = jnp.sum(diffs ** 2, axis=-1)
+    esjd = jnp.mean(squared_jumps)
+
+    log_esjd = jnp.log(esjd + 1e-10)
+
+    # Acceptance rate penalty (target 0.65 for NUTS)
+    mean_accept = jnp.mean(accept_rate)  # Keep in JAX
+    target_accept = 0.65
+    accept_penalty = (mean_accept - target_accept) ** 2
+    low_accept_guard = jnp.maximum(0.0, 0.15 - mean_accept) ** 2
+    high_accept_guard = jnp.maximum(0.0, mean_accept - 0.90) ** 2
+
+    objective_value = log_esjd - 50.0 * accept_penalty - 25.0 * (low_accept_guard + high_accept_guard)
+
+    # Parameter bounds: 0.01 <= step_size <= 1.0
+    penalty = 0.0
+    penalty += 1.0 * jnp.maximum(0.0, params.log_step_size - jnp.log(1.0)) ** 2
+    penalty += 1.0 * jnp.maximum(0.0, -params.log_step_size + jnp.log(0.01)) ** 2
+
+    return -(objective_value - penalty)
+
+
+# Variance-reduced wrappers (for consistency, though simpler samplers may not need variance reduction)
+def objective_rwmh_variance_reduced(params: RWMHParams, keys: jnp.ndarray, log_prob_fn, init_position, num_samples, burn_in):
+    return jnp.mean(jnp.array([objective_rwmh_esjd(params, k, log_prob_fn, init_position, num_samples, burn_in) for k in keys]))
+
+def objective_hmc_variance_reduced(params: HMCParams, keys: jnp.ndarray, log_prob_fn, init_position, num_samples, burn_in, max_steps: int = 200):
+    # Use vmap for proper gradient flow instead of list comprehension
+    obj_fn = lambda key: objective_hmc_esjd(params, key, log_prob_fn, init_position, num_samples, burn_in, max_steps)
+    values = vmap(obj_fn)(keys)
+    return jnp.mean(values)
+
+def objective_nuts_variance_reduced(params: NUTSParams, keys: jnp.ndarray, log_prob_fn, init_position, num_samples, burn_in):
+    return jnp.mean(jnp.array([objective_nuts_esjd(params, k, log_prob_fn, init_position, num_samples, burn_in) for k in keys]))
+
+
+# ============================================================================
+# Parameter Optimization
+# ============================================================================
 def optimize_parameters(
     key: jnp.ndarray,
     log_prob_fn: Callable,
     init_position: jnp.ndarray,
     schedule_type: str,
-    initial_dyn_params: DynamicParams, # initial guess for ε, γ
-    log_num_steps: float,               # the fixed L
+    initial_params: DynamicParams,
     num_samples: int = 1000,
     burn_in: int = 500,
-    n_optimization_steps: int = 50,
+    max_iter: int = 500,
+    min_iter: int = 50,
+    tolerance: float = 0.01,
+    patience: int = 10,
     n_runs_per_eval: int = 3,
     learning_rate: float = 0.02,
     verbose: bool = False,
-    objective_type: str = 'proposal_esjd',
-) -> Tuple[DynamicParams, List[Dict], float]: # (params, history, score)
+) -> Tuple[DynamicParams, List[Dict], float]:
     """
-    Optimize DYNAMIC RAHMC parameters (step_size, gamma, steepness) for a FIXED trajectory length.
+    Optimize all RAHMC parameters (step_size, total_time, gamma, steepness)
+    for a given friction schedule using gradient descent with convergence detection.
+
+    Parameters are optimized in log space for positivity constraints.
+    Uses variance reduction via multiple independent runs per evaluation.
+
+    Convergence Detection:
+        - Waits for min_iter iterations before checking convergence
+        - Checks relative change in best metric < tolerance
+        - Requires patience consecutive converged iterations
+        - Stops early if converged, or continues until max_iter
+
+    Returns:
+        best_params: Optimized parameters
+        history: List of dicts with iteration stats
+        best_neg_metric: Best negative ESJD achieved
     """
-    dyn_params = initial_dyn_params
-    current_log_num_steps = log_num_steps # now fixed, static arg
-    
-    if objective_type == 'proposal_esjd':
-        objective_fn = objective_proposal_esjd_variance_reduced
-        metric_name = "log(ESJD)"
-    
+    dyn_params = initial_params
+
+    objective_fn = objective_proposal_esjd_variance_reduced
+    metric_name = "log(ESJD)"
+
     optimizer = optax.adam(learning_rate)
     opt_state = optimizer.init(dyn_params)
 
     grad_fn = jax.grad(objective_fn, argnums=0)
-    
-    # track history
+
+    # Track history and convergence
     history = []
     best_neg_metric = jnp.inf
     best_dyn_params = dyn_params
-    
+    prev_best = jnp.inf
+    converged_count = 0
+
     if verbose:
         print("\n" + "="*80)
-        print(f"OPTIMIZING: {schedule_type.upper()} | FIXED L={int(jnp.exp(log_num_steps))}")
+        print(f"OPTIMIZING: {schedule_type.upper()}")
         print("="*80)
-    
-    for iteration in range(n_optimization_steps):
+
+    for iteration in range(1, max_iter + 1):
         key, *eval_keys = random.split(key, n_runs_per_eval + 1)
         eval_keys = jnp.array(eval_keys)
-        
-        # evaluate objective
+
+        # Evaluate objective
         neg_metric = objective_fn(
-            dyn_params, current_log_num_steps,
+            dyn_params,
             eval_keys, log_prob_fn, init_position,
             num_samples, burn_in, schedule_type
         )
-        
-        # compute gradient
+
+        # Compute gradient
         grads = grad_fn(
-            dyn_params, current_log_num_steps,
+            dyn_params,
             eval_keys, log_prob_fn, init_position,
             num_samples, burn_in, schedule_type
         )
-        
-        # update parameters
+
+        # Update parameters
         updates, opt_state = optimizer.update(grads, opt_state)
         dyn_params = optax.apply_updates(dyn_params, updates)
-        
-        # track best
+
+        # Track best
         if neg_metric < best_neg_metric:
             best_neg_metric = neg_metric
             best_dyn_params = dyn_params
-        
-        # rebuild full params for logging
+
+        # Convert to full params for logging
         full_params = TuningParams(
             dyn_params.log_step_size,
-            current_log_num_steps,
+            dyn_params.log_total_time,
             dyn_params.log_gamma,
             dyn_params.log_steepness
         )
@@ -474,25 +748,250 @@ def optimize_parameters(
             metric_name.lower(): float(-neg_metric),
             **params_dict,
         })
-        
-        if verbose and (iteration % 25 == 0 or iteration == n_optimization_steps - 1):
-            print(f"  Iter {iteration:3d}: {metric_name}={-float(neg_metric):7.3f} | "
-                  f"ε={params_dict['step_size']:.4f}, "
-                  f"γ={params_dict['gamma']:.4f}, "
+
+        # Check convergence after minimum iterations
+        if iteration >= min_iter:
+            relative_change = abs(best_neg_metric - prev_best) / (abs(prev_best) + 1e-10)
+            if relative_change < tolerance:
+                converged_count += 1
+            else:
+                converged_count = 0
+
+            if converged_count >= patience:
+                if verbose:
+                    print(f"  Converged after {iteration} iterations!")
+                    print(f"  Final {metric_name}={-float(best_neg_metric):7.3f}")
+                break
+
+        prev_best = best_neg_metric
+
+        if verbose and (iteration % 25 == 0 or iteration == max_iter):
+            print(f"  Iter {iteration:3d}: {metric_name}={-float(neg_metric):7.3f} (best={-float(best_neg_metric):7.3f}) | "
+                  f"step_size={params_dict['step_size']:.4f}, "
+                  f"T={params_dict['total_time']:.2f}, "
+                  f"gamma={params_dict['gamma']:.4f}, "
                   f"steep={params_dict['steepness']:.2f}")
-    
+
+    if verbose and iteration == max_iter:
+        print(f"  Reached max iterations ({max_iter})")
+
     return best_dyn_params, history, best_neg_metric
 
-# %%
-def optimize_all_schedules(
+# ============================================================================
+# Tuning Functions for Each Sampler
+# ============================================================================
+
+def tune_rwmh(
+    key: jnp.ndarray,
+    log_prob_fn: Callable,
+    init_position: jnp.ndarray,
+    max_iter: int = 500,
+    min_iter: int = 50,
+    tolerance: float = 0.01,
+    patience: int = 10,
+    num_samples: int = 1000,
+    burn_in: int = 500,
+    n_runs_per_eval: int = 2,
+    learning_rate: float = 0.02,
+    verbose: bool = True,
+) -> RWMHParams:
+    """Tune RWMH proposal_scale using gradient-based ESJD optimization."""
+    # Initialize
+    d = init_position.shape[-1]
+    initial_scale = 2.38 / jnp.sqrt(d)  # Roberts & Rosenthal optimal starting point
+    params = RWMHParams(log_proposal_scale=jnp.log(initial_scale))
+
+    optimizer = optax.adam(learning_rate)
+    opt_state = optimizer.init(params)
+    grad_fn = jax.grad(objective_rwmh_variance_reduced, argnums=0)
+
+    best_neg_metric = jnp.inf
+    best_params = params
+    prev_best = jnp.inf
+    converged_count = 0
+
+    if verbose:
+        print(f"\n{'='*80}\nTUNING RWMH\n{'='*80}")
+
+    for iteration in range(1, max_iter + 1):
+        key, *eval_keys = random.split(key, n_runs_per_eval + 1)
+        eval_keys = jnp.array(eval_keys)
+
+        neg_metric = objective_rwmh_variance_reduced(params, eval_keys, log_prob_fn, init_position, num_samples, burn_in)
+        grads = grad_fn(params, eval_keys, log_prob_fn, init_position, num_samples, burn_in)
+
+        updates, opt_state = optimizer.update(grads, opt_state)
+        params = optax.apply_updates(params, updates)
+
+        if neg_metric < best_neg_metric:
+            best_neg_metric = neg_metric
+            best_params = params
+
+        # Convergence check
+        if iteration >= min_iter:
+            relative_change = abs(best_neg_metric - prev_best) / (abs(prev_best) + 1e-10)
+            converged_count = converged_count + 1 if relative_change < tolerance else 0
+            if converged_count >= patience:
+                if verbose:
+                    print(f"  Converged after {iteration} iterations!")
+                break
+
+        prev_best = best_neg_metric
+
+        if verbose and (iteration % 25 == 0 or iteration == max_iter):
+            scale = float(jnp.exp(best_params.log_proposal_scale))
+            print(f"  Iter {iteration:3d}: ESJD={-float(best_neg_metric):7.3f} | scale={scale:.4f}")
+
+    if verbose:
+        final_dict = params_to_dict(best_params)
+        print(f"  Final proposal_scale = {final_dict['proposal_scale']:.4f}")
+
+    return best_params
+
+
+def tune_hmc(
+    key: jnp.ndarray,
+    log_prob_fn: Callable,
+    init_position: jnp.ndarray,
+    max_iter: int = 500,
+    min_iter: int = 50,
+    tolerance: float = 0.01,
+    patience: int = 10,
+    num_samples: int = 1000,
+    burn_in: int = 500,
+    n_runs_per_eval: int = 3,
+    learning_rate: float = 0.02,
+    verbose: bool = True,
+) -> HMCParams:
+    """Tune HMC step_size and total_time using gradient-based ESJD optimization."""
+    params = HMCParams(log_step_size=jnp.log(0.2), log_total_time=jnp.log(10.0))
+
+    optimizer = optax.adam(learning_rate)
+    opt_state = optimizer.init(params)
+    grad_fn = jax.grad(objective_hmc_variance_reduced, argnums=0)
+
+    best_neg_metric = jnp.inf
+    best_params = params
+    prev_best = jnp.inf
+    converged_count = 0
+
+    if verbose:
+        print(f"\n{'='*80}\nTUNING HMC\n{'='*80}")
+
+    for iteration in range(1, max_iter + 1):
+        key, *eval_keys = random.split(key, n_runs_per_eval + 1)
+        eval_keys = jnp.array(eval_keys)
+
+        neg_metric = objective_hmc_variance_reduced(params, eval_keys, log_prob_fn, init_position, num_samples, burn_in)
+        grads = grad_fn(params, eval_keys, log_prob_fn, init_position, num_samples, burn_in)
+
+        updates, opt_state = optimizer.update(grads, opt_state)
+        params = optax.apply_updates(params, updates)
+
+        if neg_metric < best_neg_metric:
+            best_neg_metric = neg_metric
+            best_params = params
+
+        if iteration >= min_iter:
+            relative_change = abs(best_neg_metric - prev_best) / (abs(prev_best) + 1e-10)
+            converged_count = converged_count + 1 if relative_change < tolerance else 0
+            if converged_count >= patience:
+                if verbose:
+                    print(f"  Converged after {iteration} iterations!")
+                break
+
+        prev_best = best_neg_metric
+
+        if verbose:
+            pdict_current = params_to_dict(params)
+            grad_norms = f"grads: step={float(grads.log_step_size):7.2f}, T={float(grads.log_total_time):7.2f}"
+            rel_change = abs(best_neg_metric - prev_best) / (abs(prev_best) + 1e-10) if iteration > 1 else float('inf')
+            # Print every iteration for monitoring
+            print(f"  {iteration:3d}: ESJD={-float(neg_metric):7.3f} (best={-float(best_neg_metric):7.3f}) | "
+                  f"step={pdict_current['step_size']:.4f}, T={pdict_current['total_time']:.2f} | "
+                  f"{grad_norms} | change={rel_change:.5f}")
+
+    if verbose:
+        final_dict = params_to_dict(best_params)
+        print(f"  Final: step_size={final_dict['step_size']:.4f}, T={final_dict['total_time']:.2f}, E[L]={final_dict['expected_num_steps']:.1f}")
+
+    return best_params
+
+
+def tune_nuts(
+    key: jnp.ndarray,
+    log_prob_fn: Callable,
+    init_position: jnp.ndarray,
+    max_iter: int = 500,
+    min_iter: int = 50,
+    tolerance: float = 0.01,
+    patience: int = 10,
+    num_samples: int = 1000,
+    burn_in: int = 500,
+    n_runs_per_eval: int = 2,
+    learning_rate: float = 0.02,
+    verbose: bool = True,
+) -> NUTSParams:
+    """Tune NUTS step_size using gradient-based ESJD optimization."""
+    params = NUTSParams(log_step_size=jnp.log(0.2))
+
+    optimizer = optax.adam(learning_rate)
+    opt_state = optimizer.init(params)
+    grad_fn = jax.grad(objective_nuts_variance_reduced, argnums=0)
+
+    best_neg_metric = jnp.inf
+    best_params = params
+    prev_best = jnp.inf
+    converged_count = 0
+
+    if verbose:
+        print(f"\n{'='*80}\nTUNING NUTS\n{'='*80}")
+
+    for iteration in range(1, max_iter + 1):
+        key, *eval_keys = random.split(key, n_runs_per_eval + 1)
+        eval_keys = jnp.array(eval_keys)
+
+        neg_metric = objective_nuts_variance_reduced(params, eval_keys, log_prob_fn, init_position, num_samples, burn_in)
+        grads = grad_fn(params, eval_keys, log_prob_fn, init_position, num_samples, burn_in)
+
+        updates, opt_state = optimizer.update(grads, opt_state)
+        params = optax.apply_updates(params, updates)
+
+        if neg_metric < best_neg_metric:
+            best_neg_metric = neg_metric
+            best_params = params
+
+        if iteration >= min_iter:
+            relative_change = abs(best_neg_metric - prev_best) / (abs(prev_best) + 1e-10)
+            converged_count = converged_count + 1 if relative_change < tolerance else 0
+            if converged_count >= patience:
+                if verbose:
+                    print(f"  Converged after {iteration} iterations!")
+                break
+
+        prev_best = best_neg_metric
+
+        if verbose and (iteration % 25 == 0 or iteration == max_iter):
+            step_size = float(jnp.exp(best_params.log_step_size))
+            print(f"  Iter {iteration:3d}: ESJD={-float(best_neg_metric):7.3f} | step_size={step_size:.4f}")
+
+    if verbose:
+        final_dict = params_to_dict(best_params)
+        print(f"  Final step_size = {final_dict['step_size']:.4f}")
+
+    return best_params
+
+
+def tune_grahmc(
     key: jnp.ndarray,
     log_prob_fn: Callable,
     init_position: jnp.ndarray,
     schedule_types: List[str] = None,
-    objective_type: str = 'proposal_esjd',
-    L_grid: List[int] = None,
-    # Other optimization params will be passed down
-    n_optimization_steps: int = 200,
+    initial_params: DynamicParams = None,
+    max_iter: int = 500,
+    min_iter: int = 50,
+    tolerance: float = 0.01,
+    patience: int = 10,
     num_samples: int = 2000,
     burn_in: int = 500,
     n_runs_per_eval: int = 3,
@@ -500,95 +999,224 @@ def optimize_all_schedules(
     verbose: bool = True,
 ) -> Dict[str, Tuple[TuningParams, List[Dict]]]:
     """
-    Find the best (L, ε, γ, steepness) by grid-searching L
-    and running GD for (ε, γ, steepness) at each L.
+    Optimize RAHMC parameters for all friction schedules.
+
+    Uses gradient descent to jointly optimize (step_size, total_time, gamma, steepness).
+    No grid search needed - total_time is optimized continuously via stochastic rounding.
+    Convergence detection automatically stops when parameters stabilize.
+
+    Returns:
+        Dictionary mapping schedule_type -> (best_params, optimization_history)
     """
-    
+
     if schedule_types is None:
         schedule_types = ['constant', 'tanh', 'sigmoid', 'linear', 'sine']
-    if L_grid is None:
-        L_grid = [25, 35, 45, 55, 65, 75]
-    
+
+    if initial_params is None:
+        # Default initialization
+        initial_params = DynamicParams(
+            log_step_size=jnp.log(0.2),     # epsilon ~ 0.2
+            log_total_time=jnp.log(10.0),   # T ~ 10 (expect ~50 steps initially)
+            log_gamma=jnp.log(0.2),         # gamma ~ 0.2
+            log_steepness=jnp.log(2.0),     # steepness ~ 2.0
+        )
+
     results = {}
-    
+
     for schedule_type in schedule_types:
         if verbose:
             print("\n" + "="*80)
             print(f"OPTIMIZING: {schedule_type.upper()}")
-            print(f"L_grid: {L_grid}")
             print("="*80)
-        
-        # Track the best result across all L's
-        best_overall_neg_metric = jnp.inf
-        best_overall_params = None
-        best_overall_history = None
 
-        # Define a consistent starting point for the GD for each L
-        initial_dyn_params = DynamicParams(
-            log_step_size=jnp.log(0.2),
-            log_gamma=jnp.log(0.2),
-            log_steepness=jnp.log(2.0),
+        key, subkey = random.split(key)
+
+        tuned_params, history, final_neg_metric = optimize_parameters(
+            key=subkey,
+            log_prob_fn=log_prob_fn,
+            init_position=init_position,
+            schedule_type=schedule_type,
+            initial_params=initial_params,
+            num_samples=num_samples,
+            burn_in=burn_in,
+            max_iter=max_iter,
+            min_iter=min_iter,
+            tolerance=tolerance,
+            patience=patience,
+            n_runs_per_eval=n_runs_per_eval,
+            learning_rate=learning_rate,
+            verbose=verbose,
         )
 
-        for L in L_grid:
-            key, subkey = random.split(key)
-            log_L_static = jnp.log(float(L))
-            
-            if verbose:
-                print(f"\n--- Optimizing for L = {L} ---")
+        # Convert to full TuningParams for consistency
+        best_overall_params = TuningParams(
+            log_step_size=tuned_params.log_step_size,
+            log_total_time=tuned_params.log_total_time,
+            log_gamma=tuned_params.log_gamma,
+            log_steepness=tuned_params.log_steepness
+        )
 
-            tuned_dyn_params, history, final_neg_metric = optimize_parameters(
-                key=subkey,
-                log_prob_fn=log_prob_fn,
-                init_position=init_position,
-                schedule_type=schedule_type,
-                initial_dyn_params=initial_dyn_params,
-                log_num_steps=log_L_static,
-                # Pass down the optimization settings
-                num_samples=num_samples,
-                burn_in=burn_in,
-                n_optimization_steps=n_optimization_steps,
-                n_runs_per_eval=n_runs_per_eval,
-                learning_rate=learning_rate,
-                verbose=False,
-                objective_type=objective_type
-            )
-            
-            if verbose:
-                print(f"--- L = {L} complete. Final Score: {-final_neg_metric:.4f} ---")
+        results[schedule_type] = (best_overall_params, history)
 
-            # Check if this L was the best one so far for this schedule
-            if final_neg_metric < best_overall_neg_metric:
-                best_overall_neg_metric = final_neg_metric
-                best_overall_history = history
-                # Reconstruct the *full* TuningParams
-                best_overall_params = TuningParams(
-                    log_step_size=tuned_dyn_params.log_step_size,
-                    log_num_steps=log_L_static,
-                    log_gamma=tuned_dyn_params.log_gamma,
-                    log_steepness=tuned_dyn_params.log_steepness
-                )
-        
-        # Store the best (L, ε, γ, steepness) combo for this schedule_type
-        results[schedule_type] = (best_overall_params, best_overall_history)
-        
-        # Print the final best result for this schedule
+        # Print summary
         if verbose:
             print("\n" + "-"*80)
             print(f"OPTIMIZATION COMPLETE FOR: {schedule_type.upper()}")
             print("-"*80)
             best_dict = params_to_dict(best_overall_params)
-            print(f"Best Metric: {-float(best_overall_neg_metric):.3f}")
+            print(f"Best Metric: {-float(final_neg_metric):.3f}")
             print(f"Optimal parameters found:")
-            print(f"  L (num_steps) = {best_dict['num_steps']}")
-            print(f"  ε (step_size) = {best_dict['step_size']:.4f}")
-            print(f"  γ (gamma)     = {best_dict['gamma']:.4f}")
-            print(f"  steepness     = {best_dict['steepness']:.2f}")
+            print(f"  step_size        = {best_dict['step_size']:.4f}")
+            print(f"  T (total_time)   = {best_dict['total_time']:.2f}")
+            print(f"  E[L] (num_steps) = {best_dict['expected_num_steps']:.1f}")
+            print(f"  gamma            = {best_dict['gamma']:.4f}")
+            print(f"  steepness        = {best_dict['steepness']:.2f}")
             print("="*80 + "\n")
 
     return results
 
-# %%
+
+# ============================================================================
+# Dispatcher Function
+# ============================================================================
+
+def tune_sampler(
+    sampler: str,
+    key: jnp.ndarray,
+    log_prob_fn: Callable,
+    init_position: jnp.ndarray,
+    schedule: str = 'constant',
+    max_iter: int = 500,
+    min_iter: int = 50,
+    tolerance: float = 0.01,
+    patience: int = 10,
+    num_samples: int = 1000,
+    burn_in: int = 500,
+    n_runs_per_eval: int = 3,
+    learning_rate: float = 0.02,
+    verbose: bool = True,
+) -> Any:
+    """
+    Dispatcher function to tune any supported MCMC sampler.
+
+    Parameters:
+        sampler: Sampler name ('rwmh', 'hmc', 'grahmc', 'nuts')
+        key: JAX random key
+        log_prob_fn: Target log probability function
+        init_position: Initial positions (n_chains, n_dim)
+        schedule: Friction schedule for GRAHMC ('constant', 'tanh', 'sigmoid', 'linear', 'sine')
+        max_iter: Maximum optimization iterations
+        min_iter: Minimum iterations before convergence check
+        tolerance: Convergence tolerance for relative change
+        patience: Number of converged iterations required
+        num_samples: Number of MCMC samples per evaluation
+        burn_in: Burn-in samples per evaluation
+        n_runs_per_eval: Number of independent runs for variance reduction
+        learning_rate: Adam learning rate
+        verbose: Print optimization progress
+
+    Returns:
+        Tuned parameters (RWMHParams, HMCParams, GRAHMCParams, or NUTSParams)
+
+    Examples:
+        # Tune RWMH
+        params = tune_sampler('rwmh', key, log_prob_fn, init_position)
+
+        # Tune GRAHMC with tanh schedule
+        params = tune_sampler('grahmc', key, log_prob_fn, init_position, schedule='tanh')
+
+        # Tune NUTS
+        params = tune_sampler('nuts', key, log_prob_fn, init_position)
+    """
+    sampler_lower = sampler.lower()
+
+    if sampler_lower == 'rwmh':
+        return tune_rwmh(
+            key, log_prob_fn, init_position,
+            max_iter=max_iter,
+            min_iter=min_iter,
+            tolerance=tolerance,
+            patience=patience,
+            num_samples=num_samples,
+            burn_in=burn_in,
+            n_runs_per_eval=n_runs_per_eval,
+            learning_rate=learning_rate,
+            verbose=verbose,
+        )
+
+    elif sampler_lower == 'hmc':
+        return tune_hmc(
+            key, log_prob_fn, init_position,
+            max_iter=max_iter,
+            min_iter=min_iter,
+            tolerance=tolerance,
+            patience=patience,
+            num_samples=num_samples,
+            burn_in=burn_in,
+            n_runs_per_eval=n_runs_per_eval,
+            learning_rate=learning_rate,
+            verbose=verbose,
+        )
+
+    elif sampler_lower == 'grahmc':
+        # For GRAHMC, tune single schedule or all schedules
+        if schedule.lower() == 'all':
+            # Tune all schedules
+            return tune_grahmc(
+                key, log_prob_fn, init_position,
+                schedule_types=['constant', 'tanh', 'sigmoid', 'linear', 'sine'],
+                max_iter=max_iter,
+                min_iter=min_iter,
+                tolerance=tolerance,
+                patience=patience,
+                num_samples=num_samples,
+                burn_in=burn_in,
+                n_runs_per_eval=n_runs_per_eval,
+                learning_rate=learning_rate,
+                verbose=verbose,
+            )
+        else:
+            # Tune single schedule
+            results = tune_grahmc(
+                key, log_prob_fn, init_position,
+                schedule_types=[schedule.lower()],
+                max_iter=max_iter,
+                min_iter=min_iter,
+                tolerance=tolerance,
+                patience=patience,
+                num_samples=num_samples,
+                burn_in=burn_in,
+                n_runs_per_eval=n_runs_per_eval,
+                learning_rate=learning_rate,
+                verbose=verbose,
+            )
+            # Extract the single result
+            return results[schedule.lower()][0]  # Return just the params
+
+    elif sampler_lower == 'nuts':
+        return tune_nuts(
+            key, log_prob_fn, init_position,
+            max_iter=max_iter,
+            min_iter=min_iter,
+            tolerance=tolerance,
+            patience=patience,
+            num_samples=num_samples,
+            burn_in=burn_in,
+            n_runs_per_eval=n_runs_per_eval,
+            learning_rate=learning_rate,
+            verbose=verbose,
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown sampler '{sampler}'. "
+            f"Supported samplers: 'rwmh', 'hmc', 'grahmc', 'nuts'"
+        )
+
+
+# ============================================================================
+# Sampling Performance Evaluation
+# ============================================================================
 def evaluate_sampling_performance(
     key: jnp.ndarray,
     log_prob_fn: Callable,
@@ -600,14 +1228,11 @@ def evaluate_sampling_performance(
     """
     Evaluate and compare sampling performance across all schedules.
 
-    Expects rahmc_run(..., track_proposals=True) to return the 9-tuple:
-      (samples, lps, accept_rate, final_state,
-       pre_positions, pre_lps, prop_positions, prop_lps, deltas_H)
-    where:
-      - samples/lps: post-MH states/logps per iteration
-      - pre_positions/pre_lps: pre-step states used to form proposals
-      - prop_positions/prop_lps: proposals (before MH)
-      - deltas_H: H1 − H0 for each proposal (per step, per chain)
+    Uses the optimized parameters to run extended sampling and compute
+    ESS, ESJD, and other performance metrics.
+
+    For evaluation, we use the expected number of steps (rounded) to ensure
+    deterministic trajectory length.
     """
 
     performance = {}
@@ -621,7 +1246,10 @@ def evaluate_sampling_performance(
 
         params_dict = params_to_dict(params)
         step_size = params_dict["step_size"]
-        num_steps = int(params_dict["num_steps"])
+        total_time = params_dict["total_time"]
+        # Use expected num_steps (rounded) for deterministic evaluation
+        num_steps = int(jnp.round(total_time / step_size))
+        num_steps = max(num_steps, 1)
         gamma = params_dict["gamma"]
         steepness = params_dict["steepness"]
 
@@ -685,7 +1313,11 @@ def evaluate_sampling_performance(
     print("=" * 80 + "\n")
     return performance
 
-# %%
+
+# ============================================================================
+# Visualization Functions
+# ============================================================================
+
 def plot_performance_summary(performance: Dict[str, Dict]):
     """Bar plots comparing key performance metrics."""
     
@@ -740,7 +1372,7 @@ def plot_performance_summary(performance: Dict[str, Dict]):
     print("✓ Saved performance summary to 'performance_summary.png'")
     plt.show()
 
-# %%
+
 def plot_friction_schedules(results: Dict[str, Tuple[TuningParams, List[Dict]]]):
     """Visualize the optimized friction schedules."""
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -892,13 +1524,33 @@ def plot_optimization_history(results: Dict[str, Tuple[TuningParams, List[Dict]]
     print("\n✓ Saved optimization history to 'optimization_history.png'")
     plt.show()
 
-# %%
+
+# ============================================================================
+# Complete Analysis Pipeline
+# ============================================================================
+
 def run_complete_analysis(
     dim: int = 10,
-    n_optimization_steps: int = 50, # steps per L
+    n_optimization_steps: int = 50,
     n_eval_samples: int = 5000,
     seed: int = 42,
 ):
+    """
+    Run complete RAHMC tuning and evaluation pipeline.
+
+    Performs parameter optimization for all friction schedules, then evaluates
+    sampling performance and generates comprehensive visualizations.
+
+    Args:
+        dim: Dimensionality of target distribution (standard normal)
+        n_optimization_steps: Number of gradient descent iterations
+        n_eval_samples: Number of samples for final evaluation
+        seed: Random seed for reproducibility
+
+    Returns:
+        results: Optimized parameters for each schedule
+        performance: Performance metrics for each schedule
+    """
     print("\n" + "="*80)
     print(f"COMPLETE RAHMC ANALYSIS: {dim}-DIMENSIONAL GAUSSIAN")
     print("="*80)
@@ -921,13 +1573,12 @@ def run_complete_analysis(
         log_prob_fn=log_prob_fn,
         init_position=init_position,
         schedule_types=['constant', 'tanh', 'sigmoid', 'linear', 'sine'],
-        L_grid=[30, 40, 50, 60],
         num_samples=1000,
         burn_in=500,
         n_optimization_steps=n_optimization_steps,
         n_runs_per_eval=3,
         learning_rate=0.015,
-        verbose=True, 
+        verbose=True,
     )
 
     print("\n" + "─"*80)
@@ -964,43 +1615,232 @@ def run_complete_analysis(
     
     return results, performance
 
-# %%
-import os
-os.environ['JAX_LOG_COMPILES'] = '1'
 
-results, performance = run_complete_analysis(
-    dim=10,
-    n_optimization_steps=300,
-    n_eval_samples=5000,
-    seed=30,
-)
+# ============================================================================
+# Main Execution
+# ============================================================================
 
-# Print summary table
-print("\n" + "="*80)
-print("FINAL SUMMARY")
-print("="*80)
-print(f"{'Schedule':<12} | {'ESS':>8} | {'Prop-ESJD':>10} | {'Chain-ESJD':>11} | {'Accept':>8} | "
-        f"{'ε':>8} | {'L':>4} | {'γ':>8}")
-print("-"*80)
+def main():
+    """Command-line interface for tuning MCMC samplers."""
+    parser = argparse.ArgumentParser(
+        description='Tune MCMC sampler parameters using gradient-based ESJD optimization',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Tune RWMH on 10D standard normal
+  python tuning.py --sampler rwmh --dim 10
 
-for schedule_type in results.keys():
-    perf = performance[schedule_type]
-    params = perf['params']
-    prop_esjd = perf.get('proposal_esjd', float('nan'))
-    chain_esjd = perf.get('accepted_esjd', float('nan'))
-    mean_ess = perf.get('mean_ess', float('nan'))
-    accept = perf.get('accept_rate', float('nan'))
+  # Tune HMC with 200 optimization steps
+  python tuning.py --sampler hmc --dim 20 --max-iter 200
 
-    print(f"{schedule_type:<12} | "
-          f"{mean_ess:8.1f} | "
-          f"{prop_esjd:10.4f} | "
-          f"{chain_esjd:11.4f} | "
-          f"{accept:8.3f} | "
-          f"{params['step_size']:8.4f} | "
-          f"{params['num_steps']:4d} | "
-          f"{params['gamma']:8.4f}")
+  # Tune GRAHMC with tanh schedule
+  python tuning.py --sampler grahmc --schedule tanh --dim 10
+
+  # Tune all GRAHMC schedules
+  python tuning.py --sampler grahmc --schedule all --dim 10
+
+  # Tune NUTS
+  python tuning.py --sampler nuts --dim 10
+
+  # Run full GRAHMC analysis (legacy mode)
+  python tuning.py --full-analysis
+        """
+    )
+
+    parser.add_argument(
+        '--sampler',
+        type=str,
+        choices=['rwmh', 'hmc', 'grahmc', 'nuts'],
+        help='MCMC sampler to tune'
+    )
+    parser.add_argument(
+        '--schedule',
+        type=str,
+        default='constant',
+        choices=['constant', 'tanh', 'sigmoid', 'linear', 'sine', 'all'],
+        help='Friction schedule for GRAHMC (default: constant)'
+    )
+    parser.add_argument(
+        '--dim',
+        type=int,
+        default=10,
+        help='Dimensionality of target distribution (default: 10)'
+    )
+    parser.add_argument(
+        '--chains',
+        type=int,
+        default=4,
+        help='Number of parallel chains (default: 4)'
+    )
+    parser.add_argument(
+        '--max-iter',
+        type=int,
+        default=500,
+        help='Maximum optimization iterations (default: 500)'
+    )
+    parser.add_argument(
+        '--min-iter',
+        type=int,
+        default=50,
+        help='Minimum iterations before convergence check (default: 50)'
+    )
+    parser.add_argument(
+        '--tolerance',
+        type=float,
+        default=0.01,
+        help='Convergence tolerance (default: 0.01)'
+    )
+    parser.add_argument(
+        '--patience',
+        type=int,
+        default=10,
+        help='Converged iterations required to stop (default: 10)'
+    )
+    parser.add_argument(
+        '--num-samples',
+        type=int,
+        default=1000,
+        help='MCMC samples per evaluation (default: 1000)'
+    )
+    parser.add_argument(
+        '--burn-in',
+        type=int,
+        default=500,
+        help='Burn-in samples per evaluation (default: 500)'
+    )
+    parser.add_argument(
+        '--n-runs',
+        type=int,
+        default=3,
+        help='Independent runs for variance reduction (default: 3)'
+    )
+    parser.add_argument(
+        '--learning-rate',
+        type=float,
+        default=0.02,
+        help='Adam learning rate (default: 0.02)'
+    )
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=42,
+        help='Random seed (default: 42)'
+    )
+    parser.add_argument(
+        '--full-analysis',
+        action='store_true',
+        help='Run full GRAHMC analysis with all schedules (legacy mode)'
+    )
+    parser.add_argument(
+        '--quiet',
+        action='store_true',
+        help='Suppress optimization progress output'
+    )
+
+    args = parser.parse_args()
+
+    # Legacy mode: full GRAHMC analysis
+    if args.full_analysis:
+        print("Running complete GRAHMC tuning analysis...")
+        results, performance = run_complete_analysis(
+            dim=args.dim,
+            n_optimization_steps=args.max_iter,
+            n_eval_samples=5000,
+            seed=args.seed,
+        )
+
+        # Print summary table
+        print("\n" + "="*80)
+        print("FINAL SUMMARY")
+        print("="*80)
+        print(f"{'Schedule':<12} | {'ESS':>8} | {'Prop-ESJD':>10} | {'Acc-ESJD':>10} | "
+              f"{'Accept':>8} | {'step_size':>10} | {'T':>7} | {'E[L]':>6} | {'gamma':>8}")
+        print("-"*80)
+
+        for schedule_type in results.keys():
+            perf = performance[schedule_type]
+            params_dict = perf['params']
+            prop_esjd = perf.get('proposal_esjd', float('nan'))
+            acc_esjd = perf.get('accepted_esjd', float('nan'))
+            mean_ess = perf.get('mean_ess', float('nan'))
+            accept = perf.get('accept_rate', float('nan'))
+
+            print(f"{schedule_type:<12} | "
+                  f"{mean_ess:8.1f} | "
+                  f"{prop_esjd:10.4f} | "
+                  f"{acc_esjd:10.4f} | "
+                  f"{accept:8.3f} | "
+                  f"{params_dict['step_size']:10.4f} | "
+                  f"{params_dict['total_time']:7.2f} | "
+                  f"{params_dict['expected_num_steps']:6.1f} | "
+                  f"{params_dict['gamma']:8.4f}")
+
+        print("="*80 + "\n")
+        return
+
+    # Standard mode: tune specific sampler
+    if args.sampler is None:
+        parser.error("--sampler is required (or use --full-analysis)")
+
+    # Setup
+    key = random.PRNGKey(args.seed)
+    key, init_key = random.split(key)
+
+    # Target: standard normal
+    log_prob_fn = standard_normal_log_prob
+    init_position = random.normal(init_key, shape=(args.chains, args.dim))
+
+    print("\n" + "="*80)
+    print(f"TUNING {args.sampler.upper()}" +
+          (f" ({args.schedule})" if args.sampler == 'grahmc' else ""))
+    print("="*80)
+    print(f"Target: {args.dim}-dimensional standard normal")
+    print(f"Chains: {args.chains}")
+    print(f"Max iterations: {args.max_iter}")
+    print(f"Convergence: tolerance={args.tolerance}, patience={args.patience}")
+    print("="*80)
+
+    # Tune
+    key, tune_key = random.split(key)
+    tuned_params = tune_sampler(
+        sampler=args.sampler,
+        key=tune_key,
+        log_prob_fn=log_prob_fn,
+        init_position=init_position,
+        schedule=args.schedule,
+        max_iter=args.max_iter,
+        min_iter=args.min_iter,
+        tolerance=args.tolerance,
+        patience=args.patience,
+        num_samples=args.num_samples,
+        burn_in=args.burn_in,
+        n_runs_per_eval=args.n_runs,
+        learning_rate=args.learning_rate,
+        verbose=not args.quiet,
+    )
+
+    # Print final parameters
+    print("\n" + "="*80)
+    print("TUNING COMPLETE")
+    print("="*80)
+
+    if args.sampler == 'grahmc' and args.schedule == 'all':
+        # Multiple schedules returned
+        print("Optimized parameters for all schedules:")
+        for schedule_name, (params, _) in tuned_params.items():
+            params_dict = params_to_dict(params)
+            print(f"\n{schedule_name.upper()}:")
+            for key, value in params_dict.items():
+                print(f"  {key:20s} = {value:.4f}")
+    else:
+        # Single parameter set returned
+        params_dict = params_to_dict(tuned_params)
+        print("Optimized parameters:")
+        for key, value in params_dict.items():
+            print(f"  {key:20s} = {value:.4f}")
+
+    print("="*80 + "\n")
 
 
-print("="*80 + "\n")
-
-
+if __name__ == '__main__':
+    main()
