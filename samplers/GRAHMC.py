@@ -1,3 +1,17 @@
+"""Generalized Repelling-Attracting Hamiltonian Monte Carlo (GRAHMC) sampler.
+
+This module implements GRAHMC with flexible friction schedules:
+- Conformal leapfrog integration with time-dependent friction
+- Five friction schedules: constant (RAHMC), tanh, sigmoid, linear, sine
+- Parallel chain execution via JAX vmap
+- Configurable step size, trajectory length, friction amplitude, and transition rate
+- Burn-in support with acceptance counter reset
+- Optional proposal tracking for diagnostics
+- Visualization tools for phase-space and position-space trajectories
+
+Based on "Repelling-Attracting Hamiltonian Monte Carlo" (Vishwanath & Tak, 2024).
+The constant schedule corresponds to the original RAHMC algorithm.
+"""
 from __future__ import annotations
 from typing import Callable, Dict, Tuple, NamedTuple
 import numpy as np
@@ -9,7 +23,7 @@ import jax
 import jax.numpy as jnp
 from jax import jit, random, vmap, lax
 
-# from utils import Array, LogProbFn, FrictionScheduleFn, _ensure_batched
+# Type aliases
 Array = jnp.ndarray
 LogProbFn = Callable[[Array], Array]  # x -> log p(x)
 FrictionScheduleFn = Callable[[float, float, float, float | None], float] # (t, T, gamma_max, steepness) -> gamma(t)
@@ -51,25 +65,44 @@ class RAHMCState(NamedTuple):
 #         return gamma_max * jnp.tanh(normalized_t)
 #     return schedule
 
-# parametrized friction schedule functions
+# Friction schedule functions
 def constant_schedule(t: float, T: float, gamma: float, steepness: float = None) -> float:
-    # steepness unused for constant
+    """Step function friction schedule (original RAHMC).
+
+    Returns -gamma for first half (repelling), +gamma for second half (attracting).
+    """
     return jnp.where(t < T/2, -gamma, +gamma)
 
 def tanh_schedule(t: float, T: float, gamma_max: float, steepness: float = 5.0) -> float:
+    """Smooth hyperbolic tangent transition from -gamma_max to +gamma_max.
+
+    Args:
+        t: Current time in trajectory
+        T: Total trajectory time
+        gamma_max: Maximum friction amplitude
+        steepness: Controls transition sharpness (default: 5.0)
+    """
     normalized_t = steepness * (2.0 * t / T - 1.0)
     return gamma_max * jnp.tanh(normalized_t)
 
 def sigmoid_schedule(t: float, T: float, gamma_max: float, steepness: float = 10.0) -> float:
+    """Sigmoid-based transition from -gamma_max to +gamma_max.
+
+    Args:
+        t: Current time in trajectory
+        T: Total trajectory time
+        gamma_max: Maximum friction amplitude
+        steepness: Controls transition sharpness (default: 10.0)
+    """
     normalized_t = steepness * (t / T - 0.5)
     return gamma_max * (2.0 / (1.0 + jnp.exp(-normalized_t)) - 1.0)
 
 def linear_schedule(t: float, T: float, gamma_max: float, steepness: float = None) -> float:
-    # steepness unused for linear
+    """Linear ramp from -gamma_max to +gamma_max."""
     return -gamma_max + (2.0 * gamma_max * t / T)
 
 def sine_schedule(t: float, T: float, gamma_max: float, steepness: float = None) -> float:
-    # steepness unused for sine
+    """Sinusoidal variation from -gamma_max to +gamma_max."""
     return gamma_max * jnp.sin(jnp.pi * (t / T - 0.5))
 
 def constant_schedule_default(t: float, T: float) -> float:
@@ -92,6 +125,15 @@ def get_friction_schedule(schedule_type: str) -> FrictionScheduleFn:
 
 
 def rahmc_init(init_position: Array, log_prob_fn: LogProbFn) -> RAHMCState:
+    """Initialize state for GRAHMC/RAHMC sampler.
+
+    Args:
+        init_position: Initial positions with shape (n_dim,) or (n_chains, n_dim)
+        log_prob_fn: Function mapping positions to log probabilities
+
+    Returns:
+        Initial RAHMCState with positions, log probs, gradients, and zero accept counts
+    """
     pos, _ = _ensure_batched(init_position)
     n_chains = pos.shape[0]
     pos_dtype = pos.dtype
@@ -116,6 +158,31 @@ def _conformal_leapfrog_step(
     grad_log_prob: Array,
     log_prob_fn: LogProbFn,
 ):
+    """Perform one conformal leapfrog step with friction.
+
+    Implements the conformal symplectic integrator:
+    1. Apply friction scaling: p *= exp(-γε/2)
+    2. Half momentum kick: p += (ε/2) * ∇log p(q)
+    3. Position update: q += ε * p
+    4. Recompute gradient at new position
+    5. Half momentum kick: p += (ε/2) * ∇log p(q')
+    6. Apply friction scaling: p *= exp(-γε/2)
+
+    When γ < 0 (repelling phase), the scaling acts as acceleration.
+    When γ > 0 (attracting phase), it dampens momentum.
+
+    Args:
+        position: Current positions, shape (n_chains, n_dim)
+        momentum: Current momenta, shape (n_chains, n_dim)
+        step_size: Integration step size
+        gamma: Friction coefficient (can be negative)
+        log_prob: Current log probabilities, shape (n_chains,)
+        grad_log_prob: Current gradients, shape (n_chains, n_dim)
+        log_prob_fn: Function to compute log probability and gradient
+
+    Returns:
+        Tuple of (new_position, new_momentum, new_log_prob, new_grad_log_prob)
+    """
     pos_dtype = position.dtype
     lp_dtype = log_prob.dtype
     eps = jnp.asarray(step_size, dtype=pos_dtype)
@@ -126,7 +193,7 @@ def _conformal_leapfrog_step(
 
     # apply friction scaling
     momentum = momentum * scale
-    # half kick  
+    # half kick
     momentum = momentum + half_eps * grad_log_prob
     # drift
     position = position + eps * momentum
@@ -142,7 +209,7 @@ def _conformal_leapfrog_step(
     return position, momentum, new_lp, new_grad_lp
 
 
-@partial(jit, static_argnames=("log_prob_fn", "friction_schedule", "num_steps")) 
+@partial(jit, static_argnames=("log_prob_fn", "friction_schedule", "num_steps"))
 def _trajectory_with_schedule(
     position: Array,
     momentum: Array,
@@ -152,13 +219,26 @@ def _trajectory_with_schedule(
     log_prob: Array,
     grad_log_prob: Array,
     num_steps: int,
-    # time_offset: float, # starting time for this half-trajectory
-    # total_time: float, # total trajectory length T
-    # these two are not necessary since our friction function's behavior is dictated by t/T.
     log_prob_fn: LogProbFn,
     friction_schedule: FrictionScheduleFn,
 ):
-    """Run a full leapfrog trajectory with time-dependent friction schedule."""
+    """Run a full leapfrog trajectory with time-dependent friction schedule.
+
+    Args:
+        position: Initial positions, shape (n_chains, n_dim)
+        momentum: Initial momenta, shape (n_chains, n_dim)
+        step_size: Integration step size
+        gamma_max: Maximum friction amplitude
+        steepness: Transition sharpness parameter (schedule-dependent)
+        log_prob: Initial log probabilities, shape (n_chains,)
+        grad_log_prob: Initial gradients, shape (n_chains, n_dim)
+        num_steps: Number of leapfrog steps
+        log_prob_fn: Function to compute log probability and gradient
+        friction_schedule: Friction schedule function
+
+    Returns:
+        Tuple of (final_position, final_momentum, final_log_prob, final_grad_log_prob)
+    """
     total_time = step_size * num_steps
 
     def body(carry, step_idx):
@@ -189,7 +269,23 @@ def rahmc_step(
     friction_schedule: FrictionScheduleFn = None,
     return_proposal: bool = False,
 ) -> Tuple[Array, RAHMCState]:
+    """Perform one GRAHMC/RAHMC step with Metropolis-Hastings acceptance.
 
+    Args:
+        state: Current RAHMC state
+        step_size: Integration step size
+        num_steps: Number of leapfrog steps
+        gamma_max: Maximum friction amplitude
+        steepness: Transition sharpness parameter
+        key: JAX random key
+        log_prob_fn: Function to compute log probability and gradient
+        friction_schedule: Friction schedule function (default: constant_schedule)
+        return_proposal: If True, return proposal info for diagnostics
+
+    Returns:
+        If return_proposal=False: (next_key, new_state)
+        If return_proposal=True: (next_key, new_state, proposal_pos, proposal_log_prob, delta_H)
+    """
     if friction_schedule is None:
         friction_schedule = constant_schedule
 
@@ -260,7 +356,33 @@ def rahmc_run(
     friction_schedule: FrictionScheduleFn = None,
     track_proposals: bool = False,
 ) -> Tuple:
-    
+    """Run GRAHMC/RAHMC sampler with parallel chains.
+
+    Args:
+        key: JAX random key
+        log_prob_fn: Function to compute log probability and gradient
+        init_position: Initial positions with shape (n_dim,) or (n_chains, n_dim)
+        step_size: Integration step size
+        num_steps: Number of leapfrog steps per iteration
+        gamma: Friction amplitude
+        steepness: Transition sharpness parameter (for tanh/sigmoid schedules)
+        num_samples: Number of samples to collect (after burn-in)
+        burn_in: Number of burn-in iterations (default: 0)
+        friction_schedule: Friction schedule function (default: constant_schedule)
+        track_proposals: If True, return proposal tracking info for diagnostics (default: False)
+
+    Returns:
+        If track_proposals=False:
+            Tuple of (samples, log_probs, accept_rate, final_state) where:
+            - samples: Array of shape (num_samples, n_chains, n_dim)
+            - log_probs: Array of shape (num_samples, n_chains)
+            - accept_rate: Acceptance rate per chain, shape (n_chains,)
+            - final_state: Final RAHMCState after sampling
+        If track_proposals=True:
+            Tuple of (post_positions, post_lps, accept_rate, final_state,
+                      pre_positions, pre_lps, prop_positions, prop_lps, deltas_H)
+            with additional proposal tracking arrays for ESJD computation
+    """
     if friction_schedule is None:
         friction_schedule = constant_schedule
 
@@ -271,7 +393,8 @@ def rahmc_run(
 
     eps = jnp.asarray(step_size, dtype=pos_type)
     gam = jnp.asarray(gamma, dtype=pos_type)
-    steep = jnp.asarray(steepness, dtype=pos_type)
+    # steepness is not used by constant_schedule, but we need a valid value for JAX arrays
+    steep = jnp.asarray(steepness if steepness is not None else 1.0, dtype=pos_type)
 
     # burn-in
     if burn_in > 0:
