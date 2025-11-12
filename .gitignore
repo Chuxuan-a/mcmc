@@ -97,3 +97,6 @@ Thumbs.db
 
 # JAX compilation cache
 jax_cache/
+
+# Scratch
+scratch/

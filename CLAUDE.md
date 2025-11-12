@@ -79,52 +79,6 @@ Comprehensive test suite for validating all samplers on standard normal distribu
 - Maintains chain continuity across batches
 - Reports ESS progress after each batch
 
-### Parameter Tuning Framework (tuning.py)
-
-The tuning system optimizes sampler hyperparameters using gradient descent on sampling efficiency metrics:
-
-**Supported samplers:**
-- RWMH: Tunes `proposal_scale`
-- HMC: Tunes `step_size` and `total_time` (uses stochastic rounding for trajectory length)
-- GRAHMC: Tunes `step_size`, `total_time`, `gamma`, and `steepness` for each friction schedule
-- NUTS: Tunes `step_size` (trajectory length is automatic)
-
-**Key components:**
-- Parameter structures: `RWMHParams`, `HMCParams`, `GRAHMCParams`, `NUTSParams` (all in log space)
-- `tune_sampler()`: Dispatcher function that routes to appropriate tuning function
-- `tune_rwmh()`, `tune_hmc()`, `tune_grahmc()`, `tune_nuts()`: Individual tuning functions
-- `optimize_parameters()`: Core optimization loop using Adam with convergence detection
-
-**Objective function:**
-- Maximizes proposal-level ESJD (Expected Squared Jump Distance)
-- Includes acceptance rate penalties to maintain target acceptance (0.234 for RWMH, 0.65 for others)
-- Uses variance reduction via multiple independent runs per evaluation
-- All computations are JIT-compiled and differentiable through JAX
-- **Straight-through estimator for trajectory length**: Uses hard thresholds `(i < actual_steps)` in forward pass (maintains detailed balance), soft sigmoid gradients in backward pass (allows gradient flow through continuous `actual_steps = T/ε`)
-
-**Convergence detection:**
-- Waits `min_iter` iterations before checking convergence
-- Checks relative change in best metric < `tolerance`
-- Requires `patience` consecutive converged iterations to stop early
-
-**Usage pattern:**
-```python
-# Tune RWMH
-params = tune_sampler('rwmh', key, log_prob_fn, init_position)
-
-# Tune GRAHMC with tanh schedule
-params = tune_sampler('grahmc', key, log_prob_fn, init_position, schedule='tanh')
-
-# Tune all GRAHMC schedules
-results = tune_sampler('grahmc', key, log_prob_fn, init_position, schedule='all')
-
-# Command line
-python tuning.py --sampler rwmh --dim 10
-python tuning.py --sampler grahmc --schedule tanh --dim 10
-```
-
-Returns tuned parameters (type depends on sampler).
-
 ### JAX Integration
 
 Critical JAX patterns used throughout:
@@ -235,7 +189,6 @@ Uses Geyer's initial positive sequence estimator (`estimate_ess_geyer()`):
 
 - JIT compilation happens on first call; expect warmup delay
 - Set `os.environ['JAX_LOG_COMPILES'] = '1'` to debug compilation
-- Use `track_proposals=True` in `rahmc_run()` only when computing ESJD (adds memory overhead)
 - Large trajectory lengths (L > 100) may cause memory issues with gradient tracking
 - Multiple chains enable better R-hat diagnostics but increase memory linearly
 
@@ -248,9 +201,7 @@ Uses Geyer's initial positive sequence estimator (`estimate_ess_geyer()`):
 │   ├── HMC.py         # Standard Hamiltonian Monte Carlo
 │   ├── NUTS.py        # No-U-Turn Sampler (automatic trajectory length)
 │   └── RWMH.py        # Random Walk Metropolis-Hastings
-├── test_samplers.py   # Comprehensive test suite with dual averaging
-├── debug_nuts.py      # Quick NUTS debugging script
-├── tuning.py          # Automated parameter optimization (gradient-based ESJD)
+├── test_samplers.py   # Comprehensive test suite with dual averaging tuning
 ├── run.ipynb          # Benchmarking and comparison notebook
 └── requirements.txt   # Python dependencies
 ```
