@@ -1,14 +1,14 @@
 # MCMC Samplers with Adaptive Friction
 
-A JAX-based research codebase for developing and benchmarking MCMC samplers, with emphasis on Randomized Adaptive Hamiltonian Monte Carlo (RAHMC) with various friction schedules.
+A JAX-based research codebase for developing and benchmarking MCMC samplers, with emphasis on Generalized Randomized Adaptive Hamiltonian Monte Carlo (GRAHMC) with various friction schedules.
 
 ## Features
 
-- **Multiple MCMC Samplers**: Random Walk Metropolis-Hastings (RWMH), Hamiltonian Monte Carlo (HMC), RAHMC, and Generalized RAHMC (GRAHMC)
-- **Friction Schedules**: Five different friction schedule functions (constant, tanh, sigmoid, linear, sine) for adaptive dynamics
-- **Automated Parameter Tuning**: Gradient-based optimization of sampler hyperparameters using JAX autodiff
+- **Multiple MCMC Samplers**: Random Walk Metropolis-Hastings (RWMH), Hamiltonian Monte Carlo (HMC), No-U-Turn Sampler (NUTS), and Generalized RAHMC (GRAHMC)
+- **Friction Schedules**: Five different friction schedule functions (constant, tanh, sigmoid, linear, sine) for time-varying friction
+- **Automated Parameter Tuning**: Dual averaging (Hoffman & Gelman 2014) with coordinate-wise optimization for GRAHMC
 - **Parallel Chain Execution**: Efficient batched sampling via JAX's `vmap()`
-- **Comprehensive Diagnostics**: ESS, R-hat, and acceptance rate tracking
+- **Comprehensive Diagnostics**: ESS, R-hat, acceptance rate tracking, and convergence detection
 
 ## Installation
 
@@ -29,41 +29,47 @@ jax.config.update("jax_enable_x64", True)
 ### Basic Sampling
 
 ```python
+import jax
 import jax.numpy as jnp
 from jax import random
-from samplers.GRAHMC import grahmc_init, grahmc_run
+from samplers.GRAHMC import rahmc_run, get_friction_schedule
 
-# Define target distribution
+# Enable float64 for numerical stability
+jax.config.update("jax_enable_x64", True)
+
+# Define target distribution (10D standard normal)
 def log_prob_fn(x):
-    return -0.5 * jnp.sum(x**2)
+    return -0.5 * jnp.sum(x**2, axis=-1)
 
-# Initialize and run sampler
+# Run GRAHMC with tanh schedule
 key = random.PRNGKey(0)
-init_pos = jnp.zeros(10)  # 10-dimensional problem
-state = grahmc_init(key, init_pos, log_prob_fn)
+init_position = random.normal(key, shape=(4, 10)) * 2.0  # 4 chains, 10 dimensions
 
-samples, log_probs, accept_rate, final_state = grahmc_run(
-    key, state, log_prob_fn,
+samples, log_probs, accept_rate, final_state = rahmc_run(
+    key, log_prob_fn, init_position,
     num_samples=1000,
-    num_burnin=500,
-    step_size=0.1,
-    num_steps=30,
-    gamma_max=1.0,
-    schedule_type='tanh'
+    burn_in=500,
+    step_size=0.05,
+    num_steps=16,
+    gamma=1.0,
+    steepness=5.0,
+    friction_schedule=get_friction_schedule('tanh')
 )
+
+print(f"Acceptance rate: {jnp.mean(accept_rate):.3f}")
+print(f"Samples shape: {samples.shape}")  # (1000, 4, 10)
 ```
 
 ### Automated Parameter Tuning
 
-```python
-from tuning import optimize_all_schedules
+```bash
+# Tune HMC with grid search over trajectory lengths
+python tuning.py --sampler hmc --dim 10 --plot
 
-results = optimize_all_schedules(
-    key, log_prob_fn, init_pos,
-    schedule_types=['constant', 'tanh', 'sigmoid', 'linear', 'sine'],
-    L_grid=[30, 40, 50, 60],  # trajectory lengths
-    n_optimization_steps=50
-)
+# Tune GRAHMC with coordinate-wise dual averaging
+python tuning.py --sampler grahmc --schedule tanh --dim 10 --plot
+
+# Results saved to ./tuning_output/ with diagnostic plots
 ```
 
 ## Project Structure

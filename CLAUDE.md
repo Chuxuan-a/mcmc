@@ -118,24 +118,21 @@ python debug_nuts.py
 
 ### Tuning sampler parameters
 ```bash
-# Tune individual samplers
-python tuning.py --sampler rwmh --dim 10
-python tuning.py --sampler hmc --dim 10
-python tuning.py --sampler nuts --dim 10
+# Tune individual samplers with grid search over trajectory lengths
+python tuning.py --sampler rwmh --dim 10 --plot
+python tuning.py --sampler hmc --dim 10 --plot
+python tuning.py --sampler nuts --dim 10 --plot
 
-# Tune GRAHMC with specific friction schedule
-python tuning.py --sampler grahmc --schedule constant --dim 10
-python tuning.py --sampler grahmc --schedule tanh --dim 10
-python tuning.py --sampler grahmc --schedule sigmoid --dim 10
-
-# Tune all GRAHMC schedules at once
-python tuning.py --sampler grahmc --schedule all --dim 10
-
-# Run full GRAHMC analysis (legacy mode with visualization)
-python tuning.py --full-analysis
+# Tune GRAHMC with specific friction schedule (uses coordinate-wise tuning)
+python tuning.py --sampler grahmc --schedule constant --dim 10 --plot
+python tuning.py --sampler grahmc --schedule tanh --dim 10 --plot
+python tuning.py --sampler grahmc --schedule sigmoid --dim 10 --plot
+python tuning.py --sampler grahmc --schedule linear --dim 10 --plot
+python tuning.py --sampler grahmc --schedule sine --dim 10 --plot
 
 # Customize tuning parameters
-python tuning.py --sampler hmc --dim 20 --max-iter 200 --chains 8
+python tuning.py --sampler hmc --dim 20 --max-iter 2000 --chains 8 --max-cycles 110
+python tuning.py --sampler grahmc --schedule tanh --dim 10 --max-cycles 50 --num-steps-grid 8,16,32
 ```
 
 ### Running notebooks
@@ -192,6 +189,35 @@ Uses Geyer's initial positive sequence estimator (`estimate_ess_geyer()`):
 - Large trajectory lengths (L > 100) may cause memory issues with gradient tracking
 - Multiple chains enable better R-hat diagnostics but increase memory linearly
 
+## Benchmark Results (10D Standard Normal)
+
+Comprehensive tuning experiments on 10D standard normal distribution using dual averaging (Hoffman & Gelman 2014):
+
+**Efficiency Ranking (ESS per Gradient Call):**
+
+| Rank | Method | Best Config | ESS/Gradient | Notes |
+|------|--------|-------------|--------------|-------|
+| 1 | **HMC** | L=8 | **0.7137** | Standard HMC dominates |
+| 2 | GRAHMC-constant | L=8 | 0.0676 | Best GRAHMC variant (10.5× slower than HMC) |
+| 3 | GRAHMC-linear | L=16 | 0.0211 | |
+| 4 | GRAHMC-sine | L=16 | 0.0201 | |
+| 5 | GRAHMC-sigmoid | L=8 | 0.0159 | Steepness parameter unstable |
+| 6 | GRAHMC-tanh | L=8 | 0.0155 | Steepness parameter unstable |
+
+**Key Findings:**
+- For 10D Gaussian targets, **standard HMC is dramatically more efficient** than GRAHMC variants
+- Among GRAHMC schedules, **constant (RAHMC) performs best**
+- Smooth schedules (tanh/sigmoid) show **steepness parameter instability** - values explode to ~10^15
+- All methods prefer **short trajectories** (L=8 or L=16) for this problem
+- GRAHMC's added friction complexity provides **no benefit** for simple Gaussian targets
+
+**Tuning Infrastructure:**
+- HMC/NUTS: Standard dual averaging for step size (target acceptance 0.65)
+- RWMH: Dual averaging for proposal scale (target acceptance 0.234)
+- GRAHMC: Coordinate-wise dual averaging for step_size, gamma, and steepness (max 110 cycles)
+- Convergence: Requires <2% relative change for 2 consecutive cycles
+- All tuning uses adaptive sampling until target ESS (1000) is reached
+
 ## File Organization
 
 ```
@@ -201,13 +227,15 @@ Uses Geyer's initial positive sequence estimator (`estimate_ess_geyer()`):
 │   ├── HMC.py         # Standard Hamiltonian Monte Carlo
 │   ├── NUTS.py        # No-U-Turn Sampler (automatic trajectory length)
 │   └── RWMH.py        # Random Walk Metropolis-Hastings
+├── tuning.py          # Automated dual averaging tuning with grid search
 ├── test_samplers.py   # Comprehensive test suite with dual averaging tuning
 ├── run.ipynb          # Benchmarking and comparison notebook
+├── tuning_output/     # Generated plots and results from tuning experiments
 └── requirements.txt   # Python dependencies
 ```
 
 ## Git Workflow
 
-Recent commits show focus on parameter tuning and removing old experimental code. When committing:
+Recent commits show focus on parameter tuning infrastructure and benchmarking. When committing:
 - Clean up old experimental files before committing
-- Use descriptive messages about tuning results (e.g., "add tuning with successful settings")
+- Use descriptive messages about tuning results (e.g., "Add coordinate-wise GRAHMC tuning with convergence detection")
