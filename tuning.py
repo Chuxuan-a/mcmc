@@ -4,10 +4,10 @@ This module provides command-line tools for tuning sampler hyperparameters
 using the dual averaging algorithm from Hoffman & Gelman (2014).
 
 Usage:
-    python tuning.py --sampler rwmh --dim 10
-    python tuning.py --sampler hmc --dim 10 --num-steps 20
-    python tuning.py --sampler nuts --dim 10
-    python tuning.py --sampler grahmc --schedule tanh --dim 10
+    python tuning.py --sampler rwmh --target standard_normal --dim 10
+    python tuning.py --sampler hmc --target neals_funnel --dim 10 --num-steps 20
+    python tuning.py --sampler nuts --target ill_conditioned_gaussian --dim 10
+    python tuning.py --sampler grahmc --target correlated_gaussian --schedule tanh --dim 10
 """
 import argparse
 import sys
@@ -27,11 +27,8 @@ from samplers.HMC import hmc_run
 from samplers.NUTS import nuts_run
 from samplers.GRAHMC import rahmc_run, get_friction_schedule
 
-
-def standard_normal_log_prob(x: jnp.ndarray) -> jnp.ndarray:
-    """Log probability of standard normal N(0, I)."""
-    D = x.shape[-1]
-    return -0.5 * (jnp.sum(x**2, axis=-1) + D * jnp.log(2.0 * jnp.pi))
+# Import target distributions
+from benchmarks.targets import TargetDistribution, get_target
 
 
 def dual_averaging_tune_rwmh(
@@ -85,7 +82,7 @@ def dual_averaging_tune_rwmh(
     accept_history = []
 
     # Run tuning iterations until convergence
-    n_samples_per_tune = 20  # More samples for better acceptance estimate
+    n_samples_per_tune = 100  # More samples for better acceptance estimate
     converged_count = 0
     converged_iter = max_iter
 
@@ -198,7 +195,7 @@ def dual_averaging_tune_hmc(
     accept_history = []
 
     # Run tuning iterations until convergence
-    n_samples_per_tune = 20  # More samples for better acceptance estimate
+    n_samples_per_tune = 100  # More samples for better acceptance estimate
     converged_count = 0
     converged_iter = max_iter
 
@@ -320,7 +317,7 @@ def dual_averaging_tune_nuts(
     tree_depth_history = []
 
     # Run tuning iterations until convergence
-    n_samples_per_tune = 20  # More samples for better acceptance estimate
+    n_samples_per_tune = 100  # More samples for better acceptance estimate
     converged_count = 0
     converged_iter = max_iter
 
@@ -453,7 +450,7 @@ def coordinate_wise_tune_grahmc(
     prev_gamma = gamma
     prev_steepness = steepness
 
-    n_samples_per_tune = 20
+    n_samples_per_tune = 100
 
     for cycle in range(max_cycles):
         print(f"    Cycle {cycle + 1}/{max_cycles}")
@@ -769,7 +766,7 @@ def plot_sampling_diagnostics(samples: jnp.ndarray, diagnostics: Dict,
 
 def tune_and_sample_rwmh(
     key: jnp.ndarray,
-    n_dim: int = 10,
+    target: TargetDistribution,
     n_chains: int = 4,
     target_ess: int = 1000,
     batch_size: int = 2000,
@@ -780,7 +777,7 @@ def tune_and_sample_rwmh(
 
     Args:
         key: JAX random key
-        n_dim: Dimensionality of target distribution
+        target: TargetDistribution object
         n_chains: Number of parallel chains
         target_ess: Target minimum bulk ESS per dimension
         batch_size: Number of samples per batch
@@ -790,14 +787,21 @@ def tune_and_sample_rwmh(
     Returns:
         Dictionary containing tuned parameters, samples, and diagnostics
     """
-    # Initialize chains (overdispersed start)
+    n_dim = target.dim
+    log_prob_fn = target.log_prob_fn
+
+    # Initialize chains (use custom sampler if provided, else overdispersed start)
     key, init_key = random.split(key)
-    init_position = random.normal(init_key, shape=(n_chains, n_dim)) * 2.0
+    if target.init_sampler is not None:
+        init_position = target.init_sampler(init_key, n_chains)
+    else:
+        init_position = random.normal(init_key, shape=(n_chains, n_dim)) * 2.0
 
     print(f"\n{'='*60}")
     print(f"TUNING RWMH SAMPLER")
     print(f"{'='*60}")
-    print(f"Target: {n_dim}D Standard Normal")
+    print(f"Target: {target.name}")
+    print(f"  {target.description}")
     print(f"Chains: {n_chains}")
     print(f"Max tuning iterations: {max_iter}")
 
@@ -805,7 +809,7 @@ def tune_and_sample_rwmh(
     print("\nTuning proposal scale...")
     key, tune_key = random.split(key)
     scale, history = dual_averaging_tune_rwmh(
-        tune_key, standard_normal_log_prob, init_position, max_iter=max_iter
+        tune_key, log_prob_fn, init_position, max_iter=max_iter
     )
 
     print(f"\n{'='*60}")
@@ -829,7 +833,7 @@ def tune_and_sample_rwmh(
         key, sample_key = random.split(key)
 
         samples_batch, lps_batch, accept_rate, final_state = rwMH_run(
-            sample_key, standard_normal_log_prob, current_position,
+            sample_key, log_prob_fn, current_position,
             num_samples=batch_size, scale=scale, burn_in=0
         )
 
@@ -912,7 +916,7 @@ def tune_and_sample_rwmh(
 
 def tune_and_sample_nuts(
     key: jnp.ndarray,
-    n_dim: int = 10,
+    target: TargetDistribution,
     n_chains: int = 4,
     target_ess: int = 1000,
     batch_size: int = 2000,
@@ -924,7 +928,7 @@ def tune_and_sample_nuts(
 
     Args:
         key: JAX random key
-        n_dim: Dimensionality of target distribution
+        target: TargetDistribution object
         n_chains: Number of parallel chains
         target_ess: Target minimum bulk ESS per dimension
         batch_size: Number of samples per batch
@@ -935,14 +939,21 @@ def tune_and_sample_nuts(
     Returns:
         Dictionary containing tuned parameters, samples, diagnostics, and cost metrics
     """
-    # Initialize chains (overdispersed start)
+    n_dim = target.dim
+    log_prob_fn = target.log_prob_fn
+
+    # Initialize chains (use custom sampler if provided, else overdispersed start)
     key, init_key = random.split(key)
-    init_position = random.normal(init_key, shape=(n_chains, n_dim)) * 2.0
+    if target.init_sampler is not None:
+        init_position = target.init_sampler(init_key, n_chains)
+    else:
+        init_position = random.normal(init_key, shape=(n_chains, n_dim)) * 2.0
 
     print(f"\n{'='*60}")
     print(f"TUNING NUTS SAMPLER")
     print(f"{'='*60}")
-    print(f"Target: {n_dim}D Standard Normal")
+    print(f"Target: {target.name}")
+    print(f"  {target.description}")
     print(f"Chains: {n_chains}")
     print(f"Max tuning iterations: {max_iter}")
     print(f"Max tree depth: {max_tree_depth}")
@@ -951,7 +962,7 @@ def tune_and_sample_nuts(
     print("\nTuning step size...")
     key, tune_key = random.split(key)
     step_size, history = dual_averaging_tune_nuts(
-        tune_key, standard_normal_log_prob, init_position,
+        tune_key, log_prob_fn, init_position,
         max_tree_depth=max_tree_depth, max_iter=max_iter
     )
 
@@ -978,7 +989,7 @@ def tune_and_sample_nuts(
         key, sample_key = random.split(key)
 
         samples_batch, lps_batch, accept_rate, final_state, tree_depths, mean_accept_probs = nuts_run(
-            sample_key, standard_normal_log_prob, current_position,
+            sample_key, log_prob_fn, current_position,
             step_size=step_size, max_tree_depth=max_tree_depth,
             num_samples=batch_size, burn_in=0
         )
@@ -1093,7 +1104,7 @@ def tune_and_sample_nuts(
 
 def tune_and_sample_hmc_grid(
     key: jnp.ndarray,
-    n_dim: int = 10,
+    target: TargetDistribution,
     n_chains: int = 4,
     target_ess: int = 1000,
     batch_size: int = 2000,
@@ -1105,7 +1116,7 @@ def tune_and_sample_hmc_grid(
 
     Args:
         key: JAX random key
-        n_dim: Dimensionality of target distribution
+        target: TargetDistribution object
         n_chains: Number of parallel chains
         target_ess: Target minimum bulk ESS per dimension
         batch_size: Number of samples per batch
@@ -1119,14 +1130,21 @@ def tune_and_sample_hmc_grid(
     if num_steps_grid is None:
         num_steps_grid = [8, 16, 32, 64]
 
-    # Initialize chains (overdispersed start)
+    n_dim = target.dim
+    log_prob_fn = target.log_prob_fn
+
+    # Initialize chains (use custom sampler if provided, else overdispersed start)
     key, init_key = random.split(key)
-    init_position = random.normal(init_key, shape=(n_chains, n_dim)) * 2.0
+    if target.init_sampler is not None:
+        init_position = target.init_sampler(init_key, n_chains)
+    else:
+        init_position = random.normal(init_key, shape=(n_chains, n_dim)) * 2.0
 
     print(f"\n{'='*60}")
     print(f"HMC GRID SEARCH")
     print(f"{'='*60}")
-    print(f"Target: {n_dim}D Standard Normal")
+    print(f"Target: {target.name}")
+    print(f"  {target.description}")
     print(f"Chains: {n_chains}")
     print(f"Grid: num_steps = {num_steps_grid}")
     print(f"Target ESS: {target_ess}")
@@ -1141,7 +1159,7 @@ def tune_and_sample_hmc_grid(
         # 1. Tune step_size for this L
         key, tune_key = random.split(key)
         step_size, tune_history = dual_averaging_tune_hmc(
-            tune_key, standard_normal_log_prob, init_position,
+            tune_key, log_prob_fn, init_position,
             num_steps=L, max_iter=max_iter
         )
 
@@ -1160,7 +1178,7 @@ def tune_and_sample_hmc_grid(
             key, sample_key = random.split(key)
 
             samples_batch, lps_batch, accept_rate, final_state = hmc_run(
-                sample_key, standard_normal_log_prob, current_position,
+                sample_key, log_prob_fn, current_position,
                 step_size=step_size, num_steps=L,
                 num_samples=batch_size, burn_in=0
             )
@@ -1243,7 +1261,7 @@ def tune_and_sample_hmc_grid(
 
 def tune_and_sample_grahmc_grid(
     key: jnp.ndarray,
-    n_dim: int = 10,
+    target: TargetDistribution,
     n_chains: int = 4,
     target_ess: int = 1000,
     batch_size: int = 2000,
@@ -1256,7 +1274,7 @@ def tune_and_sample_grahmc_grid(
 
     Args:
         key: JAX random key
-        n_dim: Dimensionality of target distribution
+        target: TargetDistribution object
         n_chains: Number of parallel chains
         target_ess: Target minimum bulk ESS per dimension
         batch_size: Number of samples per batch
@@ -1271,18 +1289,25 @@ def tune_and_sample_grahmc_grid(
     if num_steps_grid is None:
         num_steps_grid = [8, 16, 32, 64]
 
+    n_dim = target.dim
+    log_prob_fn = target.log_prob_fn
+
     # Get friction schedule
     friction_schedule = get_friction_schedule(schedule_type)
     has_steepness = schedule_type in ['tanh', 'sigmoid']
 
-    # Initialize chains (overdispersed start)
+    # Initialize chains (use custom sampler if provided, else overdispersed start)
     key, init_key = random.split(key)
-    init_position = random.normal(init_key, shape=(n_chains, n_dim)) * 2.0
+    if target.init_sampler is not None:
+        init_position = target.init_sampler(init_key, n_chains)
+    else:
+        init_position = random.normal(init_key, shape=(n_chains, n_dim)) * 2.0
 
     print(f"\n{'='*60}")
     print(f"GRAHMC GRID SEARCH ({schedule_type.upper()} schedule)")
     print(f"{'='*60}")
-    print(f"Target: {n_dim}D Standard Normal")
+    print(f"Target: {target.name}")
+    print(f"  {target.description}")
     print(f"Chains: {n_chains}")
     print(f"Grid: num_steps = {num_steps_grid}")
     print(f"Target ESS: {target_ess}")
@@ -1297,7 +1322,7 @@ def tune_and_sample_grahmc_grid(
         # 1. Coordinate-wise tune (step_size, gamma, steepness)
         key, tune_key = random.split(key)
         step_size, gamma, steepness, tune_history = coordinate_wise_tune_grahmc(
-            tune_key, standard_normal_log_prob, init_position,
+            tune_key, log_prob_fn, init_position,
             num_steps=L, schedule_type=schedule_type, max_cycles=max_cycles
         )
 
@@ -1319,7 +1344,7 @@ def tune_and_sample_grahmc_grid(
             key, sample_key = random.split(key)
 
             samples_batch, lps_batch, accept_rate, final_state = rahmc_run(
-                sample_key, standard_normal_log_prob, current_position,
+                sample_key, log_prob_fn, current_position,
                 step_size=step_size, num_steps=L,
                 gamma=gamma, steepness=steepness,
                 num_samples=batch_size, burn_in=0,
@@ -1691,6 +1716,14 @@ def main():
         help="Sampler to tune"
     )
     parser.add_argument(
+        "--target",
+        type=str,
+        default="standard_normal",
+        choices=["standard_normal", "correlated_gaussian", "ill_conditioned_gaussian",
+                 "neals_funnel", "rosenbrock"],
+        help="Target distribution (default: standard_normal)"
+    )
+    parser.add_argument(
         "--schedule",
         type=str,
         default="constant",
@@ -1775,11 +1808,14 @@ def main():
     jax.config.update("jax_enable_x64", True)
     key = random.PRNGKey(args.seed)
 
+    # Create target distribution
+    target = get_target(args.target, dim=args.dim)
+
     # Run tuning and sampling
     if args.sampler == "rwmh":
         results = tune_and_sample_rwmh(
             key=key,
-            n_dim=args.dim,
+            target=target,
             n_chains=args.chains,
             target_ess=args.target_ess,
             batch_size=args.batch_size,
@@ -1794,7 +1830,7 @@ def main():
             num_steps_grid = [int(x) for x in args.num_steps_grid.split(',')]
         results = tune_and_sample_hmc_grid(
             key=key,
-            n_dim=args.dim,
+            target=target,
             n_chains=args.chains,
             target_ess=args.target_ess,
             batch_size=args.batch_size,
@@ -1805,7 +1841,7 @@ def main():
     elif args.sampler == "nuts":
         results = tune_and_sample_nuts(
             key=key,
-            n_dim=args.dim,
+            target=target,
             n_chains=args.chains,
             target_ess=args.target_ess,
             batch_size=args.batch_size,
@@ -1821,7 +1857,7 @@ def main():
             num_steps_grid = [int(x) for x in args.num_steps_grid.split(',')]
         results = tune_and_sample_grahmc_grid(
             key=key,
-            n_dim=args.dim,
+            target=target,
             n_chains=args.chains,
             target_ess=args.target_ess,
             batch_size=args.batch_size,

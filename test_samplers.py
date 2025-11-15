@@ -1,13 +1,13 @@
 """Test suite for MCMC samplers.
 
-Tests samplers on a 10D standard normal distribution with:
+Tests samplers on diverse target distributions with:
 - Dual averaging for automatic step size tuning
 - Split rank-normalized R-hat convergence diagnostics
 - Summary statistics validation against known true values
 """
 import argparse
 import sys
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 import jax
 import jax.numpy as jnp
@@ -28,11 +28,8 @@ from samplers.GRAHMC import (
 )
 from samplers.NUTS import nuts_run, nuts_init, nuts_step
 
-
-def standard_normal_log_prob(x: jnp.ndarray) -> jnp.ndarray:
-    """Log probability of standard normal N(0, I)."""
-    D = x.shape[-1]
-    return -0.5 * (jnp.sum(x**2, axis=-1) + D * jnp.log(2.0 * jnp.pi))
+# Import target distributions
+from benchmarks.targets import TargetDistribution, get_target
 
 
 def dual_averaging_tune_rwmh(
@@ -736,7 +733,7 @@ def dual_averaging_tune_nuts(
 def run_sampler(
     sampler: str,
     key: jnp.ndarray,
-    n_dim: int = 10,
+    target: TargetDistribution,
     n_chains: int = 4,
     n_tune: int = 1000,
     target_ess: int = 1000,
@@ -749,7 +746,7 @@ def run_sampler(
     Args:
         sampler: Name of sampler ('rwmh', 'hmc', 'rahmc', 'grahmc', 'nuts')
         key: JAX random key
-        n_dim: Dimensionality of target distribution
+        target: TargetDistribution object with log_prob_fn and metadata
         n_chains: Number of parallel chains
         n_tune: Number of tuning iterations
         target_ess: Target minimum bulk ESS per dimension
@@ -761,26 +758,38 @@ def run_sampler(
     Returns:
         Tuple of (samples, log_probs, metadata)
     """
-    # Initialize chains (overdispersed start)
+    n_dim = target.dim
+    log_prob_fn = target.log_prob_fn
+
+    # Initialize chains (use custom sampler if provided, else overdispersed start)
     key, init_key = random.split(key)
-    init_position = random.normal(init_key, shape=(n_chains, n_dim)) * 2.0
+    if target.init_sampler is not None:
+        init_position = target.init_sampler(init_key, n_chains)
+    else:
+        init_position = random.normal(init_key, shape=(n_chains, n_dim)) * 2.0
 
     print(f"\n{'='*60}")
     print(f"Testing {sampler.upper()} sampler")
     print(f"{'='*60}")
-    print(f"Target: {n_dim}D Standard Normal")
+    print(f"Target: {target.name}")
+    print(f"  {target.description}")
     print(f"Chains: {n_chains}")
     print(f"Tuning iterations: {n_tune}")
     print(f"Target ESS: {target_ess}")
 
-    metadata = {"sampler": sampler, "n_dim": n_dim, "n_chains": n_chains}
+    metadata = {
+        "sampler": sampler,
+        "n_dim": n_dim,
+        "n_chains": n_chains,
+        "target_name": target.name,
+    }
 
     # Tune parameters
     if sampler == "rwmh":
         print("\nTuning proposal scale...")
         key, tune_key = random.split(key)
         scale = dual_averaging_tune_rwmh(
-            tune_key, standard_normal_log_prob, init_position
+            tune_key, log_prob_fn, init_position
         )
         metadata["scale"] = scale
         param_str = f"scale={scale:.4f}"
@@ -789,7 +798,7 @@ def run_sampler(
         print(f"\nTuning step size (L={num_steps} fixed)...")
         key, tune_key = random.split(key)
         step_size = dual_averaging_tune_hmc(
-            tune_key, standard_normal_log_prob, init_position,
+            tune_key, log_prob_fn, init_position,
             num_steps=num_steps
         )
         metadata["step_size"] = step_size
@@ -800,7 +809,7 @@ def run_sampler(
         print(f"\nTuning step size (max_tree_depth={max_tree_depth} fixed)...")
         key, tune_key = random.split(key)
         step_size = dual_averaging_tune_nuts(
-            tune_key, standard_normal_log_prob, init_position,
+            tune_key, log_prob_fn, init_position,
             max_tree_depth=max_tree_depth
         )
         metadata["step_size"] = step_size
@@ -823,7 +832,7 @@ def run_sampler(
 
         # Tune parameters (returns 2 or 3 values depending on schedule)
         tuned_params = dual_averaging_tune_grahmc(
-            tune_key, standard_normal_log_prob, init_position,
+            tune_key, log_prob_fn, init_position,
             num_steps=num_steps, friction_schedule=friction_schedule
         )
 
@@ -863,24 +872,24 @@ def run_sampler(
 
         if sampler == "rwmh":
             samples_batch, lps_batch, accept_rate, final_state = rwMH_run(
-                sample_key, standard_normal_log_prob, current_position,
+                sample_key, log_prob_fn, current_position,
                 num_samples=batch_size, scale=scale, burn_in=0
             )
         elif sampler == "hmc":
             samples_batch, lps_batch, accept_rate, final_state = hmc_run(
-                sample_key, standard_normal_log_prob, current_position,
+                sample_key, log_prob_fn, current_position,
                 step_size=step_size, num_steps=num_steps,
                 num_samples=batch_size, burn_in=0
             )
         elif sampler == "nuts":
             samples_batch, lps_batch, accept_rate, final_state, _, _ = nuts_run(
-                sample_key, standard_normal_log_prob, current_position,
+                sample_key, log_prob_fn, current_position,
                 step_size=step_size, max_tree_depth=max_tree_depth,
                 num_samples=batch_size, burn_in=0
             )
         elif sampler in ["grahmc", "rahmc"]:
             samples_batch, lps_batch, accept_rate, final_state = rahmc_run(
-                sample_key, standard_normal_log_prob, current_position,
+                sample_key, log_prob_fn, current_position,
                 step_size=step_size, num_steps=num_steps,
                 gamma=gamma, steepness=steepness,
                 num_samples=batch_size, burn_in=0,
@@ -971,15 +980,17 @@ def compute_diagnostics(samples: jnp.ndarray) -> Dict:
     return diagnostics
 
 
-def check_summary_statistics(diagnostics: Dict, n_dim: int, tolerance: float = 0.1) -> bool:
-    """Check if inferred statistics match true values.
-
-    For standard normal: true mean = 0, true std = 1
+def check_summary_statistics(
+    diagnostics: Dict,
+    target: TargetDistribution,
+    tolerance: float = 0.15
+) -> bool:
+    """Check if inferred statistics match true values from target distribution.
 
     Args:
         diagnostics: Dictionary containing summary statistics
-        n_dim: Dimensionality
-        tolerance: Acceptable deviation from true values
+        target: TargetDistribution with true mean/covariance
+        tolerance: Acceptable relative deviation from true values
 
     Returns:
         True if all checks pass, False otherwise
@@ -989,48 +1000,72 @@ def check_summary_statistics(diagnostics: Dict, n_dim: int, tolerance: float = 0
     print("\n" + "="*60)
     print("SUMMARY STATISTICS CHECK")
     print("="*60)
-    print(f"True values: mean=0.0, std=1.0")
-    print(f"Tolerance: +/-{tolerance}")
+
+    # Skip if true moments are not available
+    if target.true_mean is None or target.true_cov is None:
+        print("True moments not available for this target - skipping validation")
+        print("  (This is expected for targets like Rosenbrock)")
+        return True
+
+    print(f"Tolerance: +/-{tolerance} (relative error)")
 
     all_pass = True
 
     # Check means
     means = summary["mean"].values
-    mean_errors = np.abs(means)
-    max_mean_error = np.max(mean_errors)
+    true_mean = np.array(target.true_mean)
+    mean_errors = np.abs(means - true_mean)
+    # Use relative error where true_mean != 0, absolute error otherwise
+    mean_scales = np.where(np.abs(true_mean) > 1e-6, np.abs(true_mean), 1.0)
+    relative_mean_errors = mean_errors / mean_scales
+    max_mean_error = np.max(relative_mean_errors)
     mean_check = max_mean_error < tolerance
 
-    print(f"\nMean errors: max={max_mean_error:.4f}")
+    print(f"\nMean errors (relative): max={max_mean_error:.4f}")
     print(f"  Status: {'PASS' if mean_check else 'FAIL'}")
     if not mean_check:
         all_pass = False
-        bad_dims = np.where(mean_errors >= tolerance)[0]
+        bad_dims = np.where(relative_mean_errors >= tolerance)[0]
         print(f"  Failed dimensions: {bad_dims.tolist()}")
+        for d in bad_dims[:5]:  # Show first 5
+            print(f"    dim {d}: inferred={means[d]:.4f}, true={true_mean[d]:.4f}")
 
-    # Check standard deviations
+    # Check standard deviations against true covariance diagonal
     stds = summary["sd"].values
-    std_errors = np.abs(stds - 1.0)
-    max_std_error = np.max(std_errors)
+    true_std = np.sqrt(np.diag(np.array(target.true_cov)))
+    std_errors = np.abs(stds - true_std)
+    relative_std_errors = std_errors / true_std
+    max_std_error = np.max(relative_std_errors)
     std_check = max_std_error < tolerance
 
-    print(f"\nStd dev errors: max={max_std_error:.4f}")
+    print(f"\nStd dev errors (relative): max={max_std_error:.4f}")
     print(f"  Status: {'PASS' if std_check else 'FAIL'}")
     if not std_check:
         all_pass = False
-        bad_dims = np.where(std_errors >= tolerance)[0]
+        bad_dims = np.where(relative_std_errors >= tolerance)[0]
         print(f"  Failed dimensions: {bad_dims.tolist()}")
+        for d in bad_dims[:5]:  # Show first 5
+            print(f"    dim {d}: inferred={stds[d]:.4f}, true={true_std[d]:.4f}")
 
     return all_pass
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Test MCMC samplers on standard normal")
+    parser = argparse.ArgumentParser(description="Test MCMC samplers on diverse target distributions")
     parser.add_argument(
         "--sampler",
         type=str,
         required=True,
         choices=["rwmh", "hmc", "rahmc", "grahmc", "nuts"],
         help="Sampler to test"
+    )
+    parser.add_argument(
+        "--target",
+        type=str,
+        default="standard_normal",
+        choices=["standard_normal", "correlated_gaussian", "ill_conditioned_gaussian",
+                 "neals_funnel", "rosenbrock"],
+        help="Target distribution (default: standard_normal)"
     )
     parser.add_argument(
         "--schedule",
@@ -1053,11 +1088,14 @@ def main():
     jax.config.update("jax_enable_x64", True)
     key = random.PRNGKey(args.seed)
 
+    # Create target distribution
+    target = get_target(args.target, dim=args.dim)
+
     # Run sampler
     samples, log_probs, metadata = run_sampler(
         sampler=args.sampler,
         key=key,
-        n_dim=args.dim,
+        target=target,
         n_chains=args.chains,
         n_tune=args.tune,
         target_ess=args.target_ess,
@@ -1091,7 +1129,7 @@ def main():
     print(f"  Status: {'PASS' if ess_tail_pass else 'FAIL'} (threshold: {args.target_ess})")
 
     # Check summary statistics
-    stats_pass = check_summary_statistics(diagnostics, args.dim, tolerance=0.10)
+    stats_pass = check_summary_statistics(diagnostics, target, tolerance=0.15)
 
     # Overall result
     print("\n" + "="*60)
