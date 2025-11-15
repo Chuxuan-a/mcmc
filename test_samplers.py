@@ -41,7 +41,8 @@ def dual_averaging_tune_rwmh(
     max_iter: int = 2000,
     min_iter: int = 100,
     patience: int = 10,
-) -> float:
+    accept_tolerance: float = 0.05,
+) -> Tuple[float, Dict]:
     """Tune RWMH scale parameter using dual averaging until convergence.
 
     Based on Hoffman & Gelman (2014) NUTS paper, Section 3.2.
@@ -55,9 +56,10 @@ def dual_averaging_tune_rwmh(
         max_iter: Maximum number of tuning iterations
         min_iter: Minimum iterations before checking convergence
         patience: Number of consecutive converged iterations required
+        accept_tolerance: Acceptable deviation from target acceptance rate
 
     Returns:
-        Tuned scale parameter
+        Tuple of (tuned_scale, metadata_dict)
     """
     # Dual averaging parameters (from Stan)
     gamma = 0.05
@@ -75,15 +77,17 @@ def dual_averaging_tune_rwmh(
     scale = jnp.exp(log_scale)
     prev_scale_bar = scale
 
-    # Run tuning iterations until convergence
-    n_samples_per_tune = 20  # More samples for better acceptance estimate
+    # Run tuning iterations until convergence (evolving chain positions)
+    n_samples_per_tune = 100  # Increased from 20 for better acceptance estimate (SE ~4.8% vs 10.7%)
     converged_count = 0
+    current_position = init_position  # Track evolving positions
 
     for m in range(1, max_iter + 1):
         key, subkey = random.split(key)
-        _, _, accept_rate, _ = rwMH_run(
-            subkey, log_prob_fn, init_position, num_samples=n_samples_per_tune, scale=float(scale), burn_in=0
+        _, _, accept_rate, final_state = rwMH_run(
+            subkey, log_prob_fn, current_position, num_samples=n_samples_per_tune, scale=float(scale), burn_in=0
         )
+        current_position = final_state.position  # Update position for next iteration
         alpha = float(jnp.mean(accept_rate))
 
         # Dual averaging update
@@ -99,14 +103,23 @@ def dual_averaging_tune_rwmh(
         # Check convergence after minimum iterations
         if m >= min_iter:
             relative_change = abs(current_scale_bar - prev_scale_bar) / (abs(prev_scale_bar) + 1e-10)
-            if relative_change < tolerance:
+            accept_error = abs(alpha - target_accept)
+
+            # Both parameter and acceptance must be stable
+            if relative_change < tolerance and accept_error < accept_tolerance:
                 converged_count += 1
             else:
                 converged_count = 0
 
             if converged_count >= patience:
                 print(f"  Converged after {m} iterations: scale={current_scale_bar:.4f}, accept={alpha:.3f}")
-                return current_scale_bar
+                metadata = {
+                    "converged": True,
+                    "iterations": m,
+                    "final_accept": alpha,
+                    "target_accept": target_accept,
+                }
+                return current_scale_bar, metadata
 
         prev_scale_bar = current_scale_bar
 
@@ -114,8 +127,19 @@ def dual_averaging_tune_rwmh(
             print(f"  Tuning iteration {m}: scale={current_scale_bar:.4f}, accept={alpha:.3f}")
 
     final_scale = float(jnp.exp(log_scale_bar))
-    print(f"  Reached max iterations ({max_iter}): scale={final_scale:.4f}")
-    return final_scale
+    accept_error = abs(alpha - target_accept)
+    print(f"  Reached max iterations ({max_iter}): scale={final_scale:.4f}, accept={alpha:.3f}")
+
+    if accept_error > accept_tolerance:
+        print(f"  WARNING: Final acceptance {alpha:.3f} differs from target {target_accept} by {accept_error:.3f}")
+
+    metadata = {
+        "converged": False,
+        "iterations": max_iter,
+        "final_accept": alpha,
+        "target_accept": target_accept,
+    }
+    return final_scale, metadata
 
 
 def dual_averaging_tune_grahmc_step_size(
@@ -127,11 +151,12 @@ def dual_averaging_tune_grahmc_step_size(
     steepness: float,
     friction_schedule,
     target_accept: float = 0.65,
-    tolerance: float = 0.01,
+    tolerance: float = 0.005,  # Tighter tolerance for coordinate-wise tuning
     max_iter: int = 500,
     min_iter: int = 50,
     patience: int = 10,
-) -> float:
+    accept_tolerance: float = 0.05,
+) -> Tuple[float, Dict]:
     """Tune GRAHMC step size via dual averaging (gamma, steepness fixed).
 
     Args:
@@ -167,19 +192,21 @@ def dual_averaging_tune_grahmc_step_size(
     step_size = jnp.exp(log_step_size)
     prev_step_size_bar = float(step_size)
 
-    # Run tuning iterations until convergence
-    n_samples_per_tune = 20  # More samples for better acceptance estimate
+    # Run tuning iterations until convergence (evolving chain positions)
+    n_samples_per_tune = 100  # Increased from 20 for better acceptance estimate
     converged_count = 0
+    current_position = init_position  # Track evolving positions
 
     for m in range(1, max_iter + 1):
         key, subkey = random.split(key)
-        _, _, accept_rate, _ = rahmc_run(
-            subkey, log_prob_fn, init_position,
+        _, _, accept_rate, final_state = rahmc_run(
+            subkey, log_prob_fn, current_position,
             step_size=float(step_size), num_steps=num_steps,
             gamma=gamma, steepness=steepness,
             num_samples=n_samples_per_tune, burn_in=0,
             friction_schedule=friction_schedule
         )
+        current_position = final_state.position  # Update position for next iteration
         alpha = float(jnp.mean(accept_rate))
 
         # Dual averaging update
@@ -195,14 +222,18 @@ def dual_averaging_tune_grahmc_step_size(
         # Check convergence after minimum iterations
         if m >= min_iter:
             relative_change = abs(current_step_size_bar - prev_step_size_bar) / (abs(prev_step_size_bar) + 1e-10)
-            if relative_change < tolerance:
+            accept_error = abs(alpha - target_accept)
+
+            # Both parameter and acceptance must be stable
+            if relative_change < tolerance and accept_error < accept_tolerance:
                 converged_count += 1
             else:
                 converged_count = 0
 
             if converged_count >= patience:
                 print(f"  Converged after {m} iterations: step_size={current_step_size_bar:.4f}, accept={alpha:.3f}")
-                return current_step_size_bar
+                metadata = {"converged": True, "iterations": m, "final_accept": alpha}
+                return current_step_size_bar, metadata
 
         prev_step_size_bar = current_step_size_bar
 
@@ -210,8 +241,14 @@ def dual_averaging_tune_grahmc_step_size(
             print(f"  Tuning iteration {m}: step_size={current_step_size_bar:.4f}, accept={alpha:.3f}")
 
     final_step_size = float(jnp.exp(log_step_size_bar))
-    print(f"  Reached max iterations ({max_iter}): step_size={final_step_size:.4f}")
-    return final_step_size
+    accept_error = abs(alpha - target_accept)
+    print(f"  Reached max iterations ({max_iter}): step_size={final_step_size:.4f}, accept={alpha:.3f}")
+
+    if accept_error > accept_tolerance:
+        print(f"  WARNING: Final acceptance {alpha:.3f} differs from target {target_accept} by {accept_error:.3f}")
+
+    metadata = {"converged": False, "iterations": max_iter, "final_accept": alpha}
+    return final_step_size, metadata
 
 
 def dual_averaging_tune_grahmc_steepness(
@@ -223,11 +260,12 @@ def dual_averaging_tune_grahmc_steepness(
     gamma: float,
     friction_schedule,
     target_accept: float = 0.65,
-    tolerance: float = 0.01,
+    tolerance: float = 0.005,  # Tighter tolerance for coordinate-wise tuning
     max_iter: int = 500,
     min_iter: int = 50,
     patience: int = 10,
-) -> float:
+    accept_tolerance: float = 0.05,
+) -> Tuple[float, Dict]:
     """Tune GRAHMC steepness parameter via dual averaging (step_size, gamma fixed).
 
     Args:
@@ -263,19 +301,21 @@ def dual_averaging_tune_grahmc_steepness(
     steepness = jnp.exp(log_steepness)
     prev_steepness_bar = float(steepness)
 
-    # Run tuning iterations until convergence
-    n_samples_per_tune = 20
+    # Run tuning iterations until convergence (evolving chain positions)
+    n_samples_per_tune = 100  # Increased from 20 for better acceptance estimate
     converged_count = 0
+    current_position = init_position  # Track evolving positions
 
     for m in range(1, max_iter + 1):
         key, subkey = random.split(key)
-        _, _, accept_rate, _ = rahmc_run(
-            subkey, log_prob_fn, init_position,
+        _, _, accept_rate, final_state = rahmc_run(
+            subkey, log_prob_fn, current_position,
             step_size=step_size, num_steps=num_steps,
             gamma=gamma, steepness=float(steepness),
             num_samples=n_samples_per_tune, burn_in=0,
             friction_schedule=friction_schedule
         )
+        current_position = final_state.position  # Update position for next iteration
         alpha = float(jnp.mean(accept_rate))
 
         # Dual averaging update
@@ -291,14 +331,18 @@ def dual_averaging_tune_grahmc_steepness(
         # Check convergence after minimum iterations
         if m >= min_iter:
             relative_change = abs(current_steepness_bar - prev_steepness_bar) / (abs(prev_steepness_bar) + 1e-10)
-            if relative_change < tolerance:
+            accept_error = abs(alpha - target_accept)
+
+            # Both parameter and acceptance must be stable
+            if relative_change < tolerance and accept_error < accept_tolerance:
                 converged_count += 1
             else:
                 converged_count = 0
 
             if converged_count >= patience:
                 print(f"  Converged after {m} iterations: steepness={current_steepness_bar:.4f}, accept={alpha:.3f}")
-                return current_steepness_bar
+                metadata = {"converged": True, "iterations": m, "final_accept": alpha}
+                return current_steepness_bar, metadata
 
         prev_steepness_bar = current_steepness_bar
 
@@ -306,8 +350,14 @@ def dual_averaging_tune_grahmc_steepness(
             print(f"  Tuning iteration {m}: steepness={current_steepness_bar:.4f}, accept={alpha:.3f}")
 
     final_steepness = float(jnp.exp(log_steepness_bar))
-    print(f"  Reached max iterations ({max_iter}): steepness={final_steepness:.4f}")
-    return final_steepness
+    accept_error = abs(alpha - target_accept)
+    print(f"  Reached max iterations ({max_iter}): steepness={final_steepness:.4f}, accept={alpha:.3f}")
+
+    if accept_error > accept_tolerance:
+        print(f"  WARNING: Final acceptance {alpha:.3f} differs from target {target_accept} by {accept_error:.3f}")
+
+    metadata = {"converged": False, "iterations": max_iter, "final_accept": alpha}
+    return final_steepness, metadata
 
 
 def dual_averaging_tune_grahmc_gamma(
@@ -319,11 +369,12 @@ def dual_averaging_tune_grahmc_gamma(
     steepness: float,
     friction_schedule,
     target_accept: float = 0.65,
-    tolerance: float = 0.01,
+    tolerance: float = 0.005,  # Tighter tolerance for coordinate-wise tuning
     max_iter: int = 500,
     min_iter: int = 50,
     patience: int = 10,
-) -> float:
+    accept_tolerance: float = 0.05,
+) -> Tuple[float, Dict]:
     """Tune GRAHMC gamma (friction amplitude) via dual averaging (step_size, steepness fixed).
 
     Args:
@@ -358,19 +409,21 @@ def dual_averaging_tune_grahmc_gamma(
     gamma = jnp.exp(log_gamma)
     prev_gamma_bar = float(gamma)
 
-    # Run tuning iterations until convergence
-    n_samples_per_tune = 20
+    # Run tuning iterations until convergence (evolving chain positions)
+    n_samples_per_tune = 100  # Increased from 20 for better acceptance estimate
     converged_count = 0
+    current_position = init_position  # Track evolving positions
 
     for m in range(1, max_iter + 1):
         key, subkey = random.split(key)
-        _, _, accept_rate, _ = rahmc_run(
-            subkey, log_prob_fn, init_position,
+        _, _, accept_rate, final_state = rahmc_run(
+            subkey, log_prob_fn, current_position,
             step_size=step_size, num_steps=num_steps,
             gamma=float(gamma), steepness=steepness,
             num_samples=n_samples_per_tune, burn_in=0,
             friction_schedule=friction_schedule
         )
+        current_position = final_state.position  # Update position for next iteration
         alpha = float(jnp.mean(accept_rate))
 
         # Dual averaging update
@@ -386,14 +439,18 @@ def dual_averaging_tune_grahmc_gamma(
         # Check convergence after minimum iterations
         if m >= min_iter:
             relative_change = abs(current_gamma_bar - prev_gamma_bar) / (abs(prev_gamma_bar) + 1e-10)
-            if relative_change < tolerance:
+            accept_error = abs(alpha - target_accept)
+
+            # Both parameter and acceptance must be stable
+            if relative_change < tolerance and accept_error < accept_tolerance:
                 converged_count += 1
             else:
                 converged_count = 0
 
             if converged_count >= patience:
                 print(f"  Converged after {m} iterations: gamma={current_gamma_bar:.4f}, accept={alpha:.3f}")
-                return current_gamma_bar
+                metadata = {"converged": True, "iterations": m, "final_accept": alpha}
+                return current_gamma_bar, metadata
 
         prev_gamma_bar = current_gamma_bar
 
@@ -401,8 +458,14 @@ def dual_averaging_tune_grahmc_gamma(
             print(f"  Tuning iteration {m}: gamma={current_gamma_bar:.4f}, accept={alpha:.3f}")
 
     final_gamma = float(jnp.exp(log_gamma_bar))
-    print(f"  Reached max iterations ({max_iter}): gamma={final_gamma:.4f}")
-    return final_gamma
+    accept_error = abs(alpha - target_accept)
+    print(f"  Reached max iterations ({max_iter}): gamma={final_gamma:.4f}, accept={alpha:.3f}")
+
+    if accept_error > accept_tolerance:
+        print(f"  WARNING: Final acceptance {alpha:.3f} differs from target {target_accept} by {accept_error:.3f}")
+
+    metadata = {"converged": False, "iterations": max_iter, "final_accept": alpha}
+    return final_gamma, metadata
 
 
 def dual_averaging_tune_grahmc(
@@ -412,11 +475,11 @@ def dual_averaging_tune_grahmc(
     num_steps: int = 20,
     friction_schedule = constant_schedule,
     target_accept: float = 0.65,
-    tolerance: float = 0.01,
-    max_cycles: int = 10,
+    tolerance: float = 0.005,  # Tighter tolerance: 0.5% instead of 1%
+    max_cycles: int = 15,  # Increased from 10 for more exploration
     min_cycles: int = 2,
-    patience: int = 2,
-) -> Tuple[float, float] | Tuple[float, float, float]:
+    patience: int = 3,  # Increased from 2 for more conservative convergence
+) -> Tuple[float, float, Dict] | Tuple[float, float, float, Dict]:
     """Tune GRAHMC parameters via coordinate-wise dual averaging until convergence.
 
     For schedules with steepness (tanh, sigmoid): tunes (step_size, gamma, steepness)
@@ -468,11 +531,12 @@ def dual_averaging_tune_grahmc(
         else:
             print(f"  Tuning step_size (gamma={gamma:.4f} fixed)...")
         key, subkey = random.split(key)
-        step_size = dual_averaging_tune_grahmc_step_size(
+        step_size, _ = dual_averaging_tune_grahmc_step_size(
             subkey, log_prob_fn, init_position,
             num_steps=num_steps, gamma=gamma,
             steepness=steepness, friction_schedule=friction_schedule,
-            target_accept=target_accept
+            target_accept=target_accept,
+            tolerance=tolerance
         )
 
         # Tune gamma with fixed step_size and steepness
@@ -481,22 +545,24 @@ def dual_averaging_tune_grahmc(
         else:
             print(f"  Tuning gamma (step_size={step_size:.4f} fixed)...")
         key, subkey = random.split(key)
-        gamma = dual_averaging_tune_grahmc_gamma(
+        gamma, _ = dual_averaging_tune_grahmc_gamma(
             subkey, log_prob_fn, init_position,
             num_steps=num_steps, step_size=step_size,
             steepness=steepness, friction_schedule=friction_schedule,
-            target_accept=target_accept
+            target_accept=target_accept,
+            tolerance=tolerance
         )
 
         # Tune steepness with fixed step_size and gamma (only for tanh/sigmoid)
         if schedule_uses_steepness:
             print(f"  Tuning steepness (step_size={step_size:.4f}, gamma={gamma:.4f} fixed)...")
             key, subkey = random.split(key)
-            steepness = dual_averaging_tune_grahmc_steepness(
+            steepness, _ = dual_averaging_tune_grahmc_steepness(
                 subkey, log_prob_fn, init_position,
                 num_steps=num_steps, step_size=step_size,
                 gamma=gamma, friction_schedule=friction_schedule,
-                target_accept=target_accept
+                target_accept=target_accept,
+                tolerance=tolerance
             )
 
         # Check convergence after minimum cycles
@@ -523,24 +589,26 @@ def dual_averaging_tune_grahmc(
 
             if converged_count >= patience:
                 print(f"\n  Converged after {cycle + 1} cycles!")
+                metadata = {"converged": True, "cycles": cycle + 1}
                 if schedule_uses_steepness:
                     print(f"  Final: step_size={step_size:.4f}, gamma={gamma:.4f}, steepness={steepness:.4f}")
-                    return step_size, gamma, steepness
+                    return step_size, gamma, steepness, metadata
                 else:
                     print(f"  Final: step_size={step_size:.4f}, gamma={gamma:.4f}")
-                    return step_size, gamma
+                    return step_size, gamma, metadata
 
         prev_step_size = step_size
         prev_gamma = gamma
         prev_steepness = steepness
 
     print(f"\n  Reached max cycles ({max_cycles})")
+    metadata = {"converged": False, "cycles": max_cycles}
     if schedule_uses_steepness:
         print(f"  Final: step_size={step_size:.4f}, gamma={gamma:.4f}, steepness={steepness:.4f}")
-        return step_size, gamma, steepness
+        return step_size, gamma, steepness, metadata
     else:
         print(f"  Final: step_size={step_size:.4f}, gamma={gamma:.4f}")
-        return step_size, gamma
+        return step_size, gamma, metadata
 
 
 def dual_averaging_tune_hmc(
@@ -553,7 +621,8 @@ def dual_averaging_tune_hmc(
     max_iter: int = 2000,
     min_iter: int = 100,
     patience: int = 10,
-) -> float:
+    accept_tolerance: float = 0.05,
+) -> Tuple[float, Dict]:
     """Tune HMC step size using dual averaging until convergence.
 
     Based on Hoffman & Gelman (2014) NUTS paper, Section 3.2.
@@ -590,17 +659,19 @@ def dual_averaging_tune_hmc(
     step_size = jnp.exp(log_step_size)
     prev_step_size_bar = float(step_size)
 
-    # Run tuning iterations until convergence
-    n_samples_per_tune = 20  # More samples for better acceptance estimate
+    # Run tuning iterations until convergence (evolving chain positions)
+    n_samples_per_tune = 100  # Increased from 20 for better acceptance estimate
     converged_count = 0
+    current_position = init_position  # Track evolving positions
 
     for m in range(1, max_iter + 1):
         key, subkey = random.split(key)
-        _, _, accept_rate, _ = hmc_run(
-            subkey, log_prob_fn, init_position,
+        _, _, accept_rate, final_state = hmc_run(
+            subkey, log_prob_fn, current_position,
             step_size=float(step_size), num_steps=num_steps,
             num_samples=n_samples_per_tune, burn_in=0
         )
+        current_position = final_state.position  # Update position for next iteration
         alpha = float(jnp.mean(accept_rate))
 
         # Dual averaging update
@@ -616,14 +687,18 @@ def dual_averaging_tune_hmc(
         # Check convergence after minimum iterations
         if m >= min_iter:
             relative_change = abs(current_step_size_bar - prev_step_size_bar) / (abs(prev_step_size_bar) + 1e-10)
-            if relative_change < tolerance:
+            accept_error = abs(alpha - target_accept)
+
+            # Both parameter and acceptance must be stable
+            if relative_change < tolerance and accept_error < accept_tolerance:
                 converged_count += 1
             else:
                 converged_count = 0
 
             if converged_count >= patience:
                 print(f"  Converged after {m} iterations: step_size={current_step_size_bar:.4f}, accept={alpha:.3f}")
-                return current_step_size_bar
+                metadata = {"converged": True, "iterations": m, "final_accept": alpha, "target_accept": target_accept}
+                return current_step_size_bar, metadata
 
         prev_step_size_bar = current_step_size_bar
 
@@ -631,8 +706,14 @@ def dual_averaging_tune_hmc(
             print(f"  Tuning iteration {m}: step_size={current_step_size_bar:.4f}, accept={alpha:.3f}")
 
     final_step_size = float(jnp.exp(log_step_size_bar))
-    print(f"  Reached max iterations ({max_iter}): step_size={final_step_size:.4f}")
-    return final_step_size
+    accept_error = abs(alpha - target_accept)
+    print(f"  Reached max iterations ({max_iter}): step_size={final_step_size:.4f}, accept={alpha:.3f}")
+
+    if accept_error > accept_tolerance:
+        print(f"  WARNING: Final acceptance {alpha:.3f} differs from target {target_accept} by {accept_error:.3f}")
+
+    metadata = {"converged": False, "iterations": max_iter, "final_accept": alpha, "target_accept": target_accept}
+    return final_step_size, metadata
 
 
 def dual_averaging_tune_nuts(
@@ -645,7 +726,8 @@ def dual_averaging_tune_nuts(
     max_iter: int = 2000,
     min_iter: int = 100,
     patience: int = 10,
-) -> float:
+    accept_tolerance: float = 0.05,
+) -> Tuple[float, Dict]:
     """Tune NUTS step size using dual averaging until convergence.
 
     Based on Hoffman & Gelman (2014) NUTS paper, Section 3.2.
@@ -681,18 +763,20 @@ def dual_averaging_tune_nuts(
     step_size = jnp.exp(log_step_size)
     prev_step_size_bar = float(step_size)
 
-    # Run tuning iterations until convergence
-    n_samples_per_tune = 20  # More samples for better acceptance estimate
+    # Run tuning iterations until convergence (evolving chain positions)
+    n_samples_per_tune = 100  # Increased from 20 for better acceptance estimate
     converged_count = 0
+    current_position = init_position  # Track evolving positions
 
     for m in range(1, max_iter + 1):
         key, subkey = random.split(key)
         # Run NUTS to collect samples and get acceptance statistics
-        _, _, _, _, tree_depths, mean_accept_probs = nuts_run(
-            subkey, log_prob_fn, init_position,
+        _, _, _, final_state, tree_depths, mean_accept_probs = nuts_run(
+            subkey, log_prob_fn, current_position,
             step_size=float(step_size), max_tree_depth=max_tree_depth,
             num_samples=n_samples_per_tune, burn_in=0
         )
+        current_position = final_state.position  # Update position for next iteration
         # Use the mean of Metropolis acceptance probabilities from leapfrog trajectories
         # This is the standard statistic for NUTS dual averaging (Hoffman & Gelman 2014)
         alpha = float(jnp.mean(mean_accept_probs))
@@ -711,14 +795,18 @@ def dual_averaging_tune_nuts(
         # Check convergence after minimum iterations
         if m >= min_iter:
             relative_change = abs(current_step_size_bar - prev_step_size_bar) / (abs(prev_step_size_bar) + 1e-10)
-            if relative_change < tolerance:
+            accept_error = abs(alpha - target_accept)
+
+            # Both parameter and acceptance must be stable
+            if relative_change < tolerance and accept_error < accept_tolerance:
                 converged_count += 1
             else:
                 converged_count = 0
 
             if converged_count >= patience:
                 print(f"  Converged after {m} iterations: step_size={current_step_size_bar:.4f}, accept={alpha:.3f}")
-                return current_step_size_bar
+                metadata = {"converged": True, "iterations": m, "final_accept": alpha, "target_accept": target_accept}
+                return current_step_size_bar, metadata
 
         prev_step_size_bar = current_step_size_bar
 
@@ -726,8 +814,14 @@ def dual_averaging_tune_nuts(
             print(f"  Tuning iteration {m}: step_size={current_step_size_bar:.4f}, accept={alpha:.3f}")
 
     final_step_size = float(jnp.exp(log_step_size_bar))
-    print(f"  Reached max iterations ({max_iter}): step_size={final_step_size:.4f}")
-    return final_step_size
+    accept_error = abs(alpha - target_accept)
+    print(f"  Reached max iterations ({max_iter}): step_size={final_step_size:.4f}, accept={alpha:.3f}")
+
+    if accept_error > accept_tolerance:
+        print(f"  WARNING: Final acceptance {alpha:.3f} differs from target {target_accept} by {accept_error:.3f}")
+
+    metadata = {"converged": False, "iterations": max_iter, "final_accept": alpha, "target_accept": target_accept}
+    return final_step_size, metadata
 
 
 def run_sampler(
@@ -788,32 +882,38 @@ def run_sampler(
     if sampler == "rwmh":
         print("\nTuning proposal scale...")
         key, tune_key = random.split(key)
-        scale = dual_averaging_tune_rwmh(
+        scale, tune_meta = dual_averaging_tune_rwmh(
             tune_key, log_prob_fn, init_position
         )
         metadata["scale"] = scale
+        metadata["tuning_converged"] = tune_meta["converged"]
+        metadata["tuning_iterations"] = tune_meta["iterations"]
         param_str = f"scale={scale:.4f}"
     elif sampler == "hmc":
         num_steps = 20  # Fixed trajectory length (not tuned - requires grid search)
         print(f"\nTuning step size (L={num_steps} fixed)...")
         key, tune_key = random.split(key)
-        step_size = dual_averaging_tune_hmc(
+        step_size, tune_meta = dual_averaging_tune_hmc(
             tune_key, log_prob_fn, init_position,
             num_steps=num_steps
         )
         metadata["step_size"] = step_size
         metadata["num_steps"] = num_steps
+        metadata["tuning_converged"] = tune_meta["converged"]
+        metadata["tuning_iterations"] = tune_meta["iterations"]
         param_str = f"step_size={step_size:.4f}, L={num_steps}"
     elif sampler == "nuts":
         max_tree_depth = 10  # Maximum tree depth (max trajectory = 2^10 = 1024 steps)
         print(f"\nTuning step size (max_tree_depth={max_tree_depth} fixed)...")
         key, tune_key = random.split(key)
-        step_size = dual_averaging_tune_nuts(
+        step_size, tune_meta = dual_averaging_tune_nuts(
             tune_key, log_prob_fn, init_position,
             max_tree_depth=max_tree_depth
         )
         metadata["step_size"] = step_size
         metadata["max_tree_depth"] = max_tree_depth
+        metadata["tuning_converged"] = tune_meta["converged"]
+        metadata["tuning_iterations"] = tune_meta["iterations"]
         param_str = f"step_size={step_size:.4f}, max_depth={max_tree_depth}"
     elif sampler in ["grahmc", "rahmc"]:
         # Map schedule type to schedule function
@@ -830,28 +930,32 @@ def run_sampler(
         print(f"\nTuning parameters for {schedule_type} friction schedule via coordinate-wise dual averaging (L={num_steps} fixed)...")
         key, tune_key = random.split(key)
 
-        # Tune parameters (returns 2 or 3 values depending on schedule)
+        # Tune parameters (returns 2 or 3 values + metadata depending on schedule)
         tuned_params = dual_averaging_tune_grahmc(
             tune_key, log_prob_fn, init_position,
             num_steps=num_steps, friction_schedule=friction_schedule
         )
 
-        # Unpack based on number of returned values
-        if len(tuned_params) == 3:
-            step_size, gamma, steepness = tuned_params
+        # Unpack based on number of returned values (now includes metadata as last element)
+        if len(tuned_params) == 4:
+            step_size, gamma, steepness, tune_meta = tuned_params
             metadata["step_size"] = step_size
             metadata["num_steps"] = num_steps
             metadata["gamma"] = gamma
             metadata["steepness"] = steepness
             metadata["schedule_type"] = schedule_type
+            metadata["tuning_converged"] = tune_meta["converged"]
+            metadata["tuning_cycles"] = tune_meta["cycles"]
             param_str = f"step_size={step_size:.4f}, L={num_steps}, gamma={gamma:.4f}, steepness={steepness:.4f}"
         else:
-            step_size, gamma = tuned_params
+            step_size, gamma, tune_meta = tuned_params
             steepness = None
             metadata["step_size"] = step_size
             metadata["num_steps"] = num_steps
             metadata["gamma"] = gamma
             metadata["schedule_type"] = schedule_type
+            metadata["tuning_converged"] = tune_meta["converged"]
+            metadata["tuning_cycles"] = tune_meta["cycles"]
             param_str = f"step_size={step_size:.4f}, L={num_steps}, gamma={gamma:.4f}"
     else:
         raise ValueError(f"Unknown sampler: {sampler}")
