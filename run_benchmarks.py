@@ -36,6 +36,7 @@ def run_single_benchmark(
     batch_size: int = 2000,
     max_samples: int = 50000,
     schedule_type: str = "constant",
+    fixed_budget: int = None,
 ) -> Dict:
     """Run a single sampler-target benchmark and return results."""
 
@@ -46,22 +47,35 @@ def run_single_benchmark(
     start_time = time.time()
 
     try:
-        samples, log_probs, metadata = run_sampler(
-            sampler=sampler,
-            key=key,
-            target=target,
-            n_chains=n_chains,
-            target_ess=target_ess,
-            batch_size=batch_size,
-            max_samples=max_samples,
-            schedule_type=schedule_type,
-        )
+        # Use fixed budget mode if specified
+        if fixed_budget is not None:
+            samples, log_probs, metadata = run_sampler(
+                sampler=sampler,
+                key=key,
+                target=target,
+                n_chains=n_chains,
+                target_ess=fixed_budget,  # Use as sample count in fixed mode
+                batch_size=fixed_budget,  # Single batch
+                max_samples=fixed_budget,
+                schedule_type=schedule_type,
+            )
+        else:
+            samples, log_probs, metadata = run_sampler(
+                sampler=sampler,
+                key=key,
+                target=target,
+                n_chains=n_chains,
+                target_ess=target_ess,
+                batch_size=batch_size,
+                max_samples=max_samples,
+                schedule_type=schedule_type,
+            )
 
         # Compute diagnostics
         diagnostics = compute_diagnostics(samples)
 
         # Check summary statistics
-        stats_pass = check_summary_statistics(diagnostics, target, tolerance=0.15)
+        stats_pass = check_summary_statistics(diagnostics, target, tolerance=0.15, total_samples=samples.shape[0])
 
         elapsed_time = time.time() - start_time
 
@@ -85,9 +99,11 @@ def run_single_benchmark(
             # Pass/fail
             "rhat_pass": diagnostics["rhat_max"] < 1.01,
             "ess_pass": diagnostics["ess_bulk_min"] >= target_ess,
+            "ess_tail_pass": diagnostics["ess_tail_min"] >= target_ess * 0.5,  # 50% threshold for tail
             "stats_pass": stats_pass,
             "overall_pass": (diagnostics["rhat_max"] < 1.01 and
                            diagnostics["ess_bulk_min"] >= target_ess and
+                           diagnostics["ess_tail_min"] >= target_ess * 0.5 and
                            stats_pass),
         }
 
@@ -139,6 +155,7 @@ def run_all_benchmarks(
     max_samples: int,
     seed: int,
     output_dir: str,
+    fixed_budget: int = None,
 ) -> pd.DataFrame:
     """Run all sampler-target combinations and save results."""
 
@@ -169,6 +186,7 @@ def run_all_benchmarks(
                         batch_size=batch_size,
                         max_samples=max_samples,
                         schedule_type=schedule,
+                        fixed_budget=fixed_budget,
                     )
                     all_results.append(results)
             else:
@@ -182,6 +200,7 @@ def run_all_benchmarks(
                     target_ess=target_ess,
                     batch_size=batch_size,
                     max_samples=max_samples,
+                    fixed_budget=fixed_budget,
                 )
                 all_results.append(results)
 
@@ -287,8 +306,8 @@ def main():
     parser.add_argument(
         "--targets",
         nargs="+",
-        default=["standard_normal", "correlated_gaussian", "ill_conditioned_gaussian", "neals_funnel", "rosenbrock"],
-        choices=["standard_normal", "correlated_gaussian", "ill_conditioned_gaussian", "neals_funnel", "rosenbrock"],
+        default=["standard_normal", "correlated_gaussian", "ill_conditioned_gaussian", "neals_funnel", "log_gamma", "gaussian_mixture"],
+        choices=["standard_normal", "correlated_gaussian", "ill_conditioned_gaussian", "neals_funnel", "log_gamma", "gaussian_mixture"],
         help="Target distributions (default: all)"
     )
 
@@ -320,6 +339,13 @@ def main():
         help="Skip confirmation prompt (useful for automation)"
     )
 
+    parser.add_argument(
+        "--fixed-budget",
+        type=int,
+        default=None,
+        help="Use fixed sample budget instead of adaptive ESS targeting (e.g., --fixed-budget 20000)"
+    )
+
     args = parser.parse_args()
 
     # Quick mode overrides
@@ -343,7 +369,10 @@ def main():
         print(f"GRAHMC schedules: {', '.join(args.grahmc_schedules)}")
     print(f"Dimensionality: {args.dim}")
     print(f"Chains: {args.chains}")
-    print(f"Target ESS: {args.target_ess}")
+    if args.fixed_budget:
+        print(f"Mode: Fixed budget ({args.fixed_budget} samples)")
+    else:
+        print(f"Mode: Adaptive ESS targeting (target: {args.target_ess})")
     print(f"Output: {args.output_dir}")
 
     # Calculate total experiments
@@ -368,6 +397,7 @@ def main():
         max_samples=args.max_samples,
         seed=args.seed,
         output_dir=args.output_dir,
+        fixed_budget=args.fixed_budget,
     )
 
     total_time = time.time() - start_time

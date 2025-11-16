@@ -213,52 +213,133 @@ def neals_funnel(dim: int = 10) -> TargetDistribution:
     )
 
 
-def rosenbrock(dim: int = 10, scale: float = 0.1) -> TargetDistribution:
+def log_gamma(dim: int = 10, shape: float = 2.0, rate: float = 1.0) -> TargetDistribution:
     """
-    Rosenbrock "banana" distribution: strongly curved, banana-shaped density.
+    Independent log-Gamma distribution (each dimension is Gamma distributed).
 
-    Structure (following Haario et al. 2001):
-        log p(x) = -sum_{i=1}^{dim-1} [(x[i+1] - x[i]^2)^2 / (2*scale^2) + (x[i] - 1)^2 / 2]
+    Structure:
+        x_i ~ Gamma(shape, rate) for all i
+        log p(x) = sum_i [(shape-1)*log(x_i) - rate*x_i - log(Gamma(shape)) - shape*log(rate)]
 
-    Tests: Curved geometry, strong nonlinear correlations.
+    Tests: Heavy tails, asymmetry, positivity constraints.
 
     Args:
-        dim: Dimensionality (recommended: 10-20).
-        scale: Scale parameter controlling curvature (smaller = more curved).
+        dim: Dimensionality
+        shape: Shape parameter (alpha > 0)
+        rate: Rate parameter (beta > 0)
 
     Returns:
-        TargetDistribution with Rosenbrock log probability.
+        TargetDistribution with log-Gamma log probability.
     """
+    from jax.scipy.special import gammaln
+
     def log_prob_fn(x):
-        # x can be (dim,) or (n_chains, dim)
+        # Check positivity constraint
         if x.ndim == 1:
-            x_curr = x[:-1]
-            x_next = x[1:]
+            valid = jnp.all(x > 0)
+            sum_axis = None
         else:
-            x_curr = x[:, :-1]
-            x_next = x[:, 1:]
+            valid = jnp.all(x > 0, axis=-1)
+            sum_axis = -1
 
-        # Banana term: (x_{i+1} - x_i^2)^2 / (2 * scale^2)
-        banana_term = jnp.sum((x_next - x_curr**2)**2, axis=-1) / (2.0 * scale**2)
+        # Gamma log pdf: (shape-1)*log(x) - rate*x - log(Gamma(shape)) - shape*log(rate)
+        log_normalizer = gammaln(shape) + shape * jnp.log(rate)
+        log_pdf = (shape - 1.0) * jnp.log(jnp.maximum(x, 1e-10)) - rate * x - log_normalizer
+        result = jnp.sum(log_pdf, axis=sum_axis) if sum_axis is not None else jnp.sum(log_pdf)
 
-        # Centering term: (x_i - 1)^2 / 2
-        centering_term = jnp.sum((x_curr - 1.0)**2, axis=-1) / 2.0
-
-        return -(banana_term + centering_term)
+        # Return -inf for invalid (negative) values
+        return jnp.where(valid, result, -jnp.inf)
 
     def init_sampler(key, n_chains):
-        """Initialize near mode at (1, 1, ..., 1)."""
-        return random.normal(key, (n_chains, dim)) * 0.5 + 1.0
+        """Initialize from prior (Gamma distribution)."""
+        return random.gamma(key, shape, (n_chains, dim)) / rate
 
-    # True moments not analytically tractable - set to None
-    # Empirically, mode is near (1, 1, ..., 1)
+    # True moments for Gamma distribution
+    true_mean = jnp.ones(dim) * (shape / rate)
+    true_var = shape / (rate ** 2)
+    true_cov = jnp.eye(dim) * true_var
+
     return TargetDistribution(
         log_prob_fn=log_prob_fn,
         dim=dim,
-        true_mean=None,  # Not analytically tractable
-        true_cov=None,   # Not analytically tractable
-        name=f"Rosenbrock{dim}D_scale{scale}",
-        description=f"{dim}D Rosenbrock (banana) - tests curved geometry",
+        true_mean=true_mean,
+        true_cov=true_cov,
+        name=f"LogGamma{dim}D_shape{shape}_rate{rate}",
+        description=f"{dim}D independent Gamma - tests heavy tails and asymmetry",
+        init_sampler=init_sampler
+    )
+
+
+def gaussian_mixture(dim: int = 10, n_modes: int = 2, separation: float = 5.0) -> TargetDistribution:
+    """
+    Mixture of Gaussians in 1D with remaining dimensions independent.
+
+    Structure (simplified for tractability):
+        x[0] ~ 0.5 * N(-separation/2, 1) + 0.5 * N(+separation/2, 1)
+        x[i] ~ N(0, 1) for i > 0
+
+    Tests: Multimodality, mode-switching ability.
+
+    Args:
+        dim: Dimensionality (only first dimension is mixture)
+        n_modes: Number of modes (currently only 2 supported)
+        separation: Distance between modes
+
+    Returns:
+        TargetDistribution with Gaussian mixture log probability.
+    """
+    if n_modes != 2:
+        raise NotImplementedError("Only 2-mode mixture currently supported")
+
+    def log_prob_fn(x):
+        # x can be (dim,) or (n_chains, dim)
+        if x.ndim == 1:
+            x0 = x[0]
+            x_rest = x[1:]
+        else:
+            x0 = x[:, 0]
+            x_rest = x[:, 1:]
+
+        # Mixture component in first dimension: 0.5*N(-sep/2, 1) + 0.5*N(+sep/2, 1)
+        mode1 = -0.5 * (x0 + separation / 2.0) ** 2
+        mode2 = -0.5 * (x0 - separation / 2.0) ** 2
+        # log-sum-exp trick for stability
+        max_val = jnp.maximum(mode1, mode2)
+        log_p_x0 = jnp.log(0.5) + max_val + jnp.log(jnp.exp(mode1 - max_val) + jnp.exp(mode2 - max_val)) - 0.5 * jnp.log(2.0 * jnp.pi)
+
+        # Remaining dimensions are standard normal
+        if x.ndim == 1:
+            log_p_rest = -0.5 * (jnp.sum(x_rest ** 2) + (dim - 1) * jnp.log(2.0 * jnp.pi))
+        else:
+            log_p_rest = -0.5 * (jnp.sum(x_rest ** 2, axis=-1) + (dim - 1) * jnp.log(2.0 * jnp.pi))
+
+        return log_p_x0 + log_p_rest
+
+    def init_sampler(key, n_chains):
+        """Initialize with chains split between the two modes."""
+        key1, key2 = random.split(key)
+        # Half chains near mode 1, half near mode 2
+        n_half = n_chains // 2
+        x0_mode1 = random.normal(key1, (n_half,)) - separation / 2.0
+        x0_mode2 = random.normal(key1, (n_chains - n_half,)) + separation / 2.0
+        x0 = jnp.concatenate([x0_mode1, x0_mode2])[:, None]
+        x_rest = random.normal(key2, (n_chains, dim - 1))
+        return jnp.concatenate([x0, x_rest], axis=1)
+
+    # True mean is 0 for all dimensions (symmetric mixture)
+    # True variance: x0 has var = 1 + (separation/2)^2
+    var_x0 = 1.0 + (separation / 2.0) ** 2
+    true_mean = jnp.zeros(dim)
+    true_cov_diag = jnp.concatenate([jnp.array([var_x0]), jnp.ones(dim - 1)])
+    true_cov = jnp.diag(true_cov_diag)
+
+    return TargetDistribution(
+        log_prob_fn=log_prob_fn,
+        dim=dim,
+        true_mean=true_mean,
+        true_cov=true_cov,
+        name=f"GaussianMixture{dim}D_modes{n_modes}_sep{separation}",
+        description=f"{dim}D Gaussian mixture (x[0] bimodal) - tests mode-switching",
         init_sampler=init_sampler
     )
 
@@ -273,7 +354,8 @@ def get_target(name: str, dim: int = 10, **kwargs) -> TargetDistribution:
 
     Args:
         name: One of ['standard_normal', 'correlated_gaussian',
-                      'ill_conditioned_gaussian', 'neals_funnel', 'rosenbrock']
+                      'ill_conditioned_gaussian', 'neals_funnel',
+                      'log_gamma', 'gaussian_mixture']
         dim: Dimensionality for the target.
         **kwargs: Additional arguments passed to target factory.
 
@@ -285,7 +367,8 @@ def get_target(name: str, dim: int = 10, **kwargs) -> TargetDistribution:
         'correlated_gaussian': correlated_gaussian,
         'ill_conditioned_gaussian': ill_conditioned_gaussian,
         'neals_funnel': neals_funnel,
-        'rosenbrock': rosenbrock,
+        'log_gamma': log_gamma,
+        'gaussian_mixture': gaussian_mixture,
     }
 
     if name not in targets:
@@ -301,7 +384,8 @@ def list_targets():
         correlated_gaussian(10),
         ill_conditioned_gaussian(10),
         neals_funnel(10),
-        rosenbrock(10),
+        log_gamma(10),
+        gaussian_mixture(10),
     ]
 
     print("Available Target Distributions:")

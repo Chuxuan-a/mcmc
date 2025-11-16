@@ -6,7 +6,8 @@ from .targets import (
     correlated_gaussian,
     ill_conditioned_gaussian,
     neals_funnel,
-    rosenbrock,
+    log_gamma,
+    gaussian_mixture,
     get_target,
     list_targets,
 )
