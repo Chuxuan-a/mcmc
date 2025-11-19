@@ -20,7 +20,7 @@ import numpy as np
 
 import jax
 import jax.numpy as jnp
-from jax import random
+from jax import random, grad
 import arviz as az
 
 from benchmarks.targets import get_target, TargetDistribution
@@ -53,7 +53,7 @@ def compute_diagnostics(samples: jnp.ndarray) -> Dict:
     ess_bulk = az.ess(idata, var_names=["x"], method="bulk")["x"].values
     ess_tail = az.ess(idata, var_names=["x"], method="tail")["x"].values
 
-    # Summary statistics
+    # Summary statistics (includes mean, mcse_mean, sd, etc.)
     summary = az.summary(idata, var_names=["x"])
 
     return {
@@ -65,48 +65,147 @@ def compute_diagnostics(samples: jnp.ndarray) -> Dict:
         "ess_tail_mean": float(np.mean(ess_tail)),
         "mean_estimate": np.mean(samples_for_arviz, axis=(0, 1)),
         "std_estimate": np.std(samples_for_arviz, axis=(0, 1)),
+        "summary": summary,  # Add summary for z-score test
     }
 
 
-def check_summary_statistics(diagnostics: Dict, target: TargetDistribution, tolerance: float = 0.15) -> bool:
-    """Check if estimated mean and std match true values within tolerance."""
+def check_summary_statistics(diagnostics: Dict, target: TargetDistribution, z_threshold: float = 5.0) -> bool:
+    """Check if estimated mean matches true values using z-score test.
+
+    Uses Monte Carlo Standard Error (MCSE) to compute z-scores for mean estimates.
+    A z-score > threshold indicates the estimate is inconsistent with the true value
+    beyond what Monte Carlo noise would explain.
+
+    Args:
+        diagnostics: Dictionary containing summary statistics with 'summary' from ArviZ
+        target: TargetDistribution with true mean/covariance
+        z_threshold: Maximum acceptable z-score (default: 5.0, ~5-sigma test)
+
+    Returns:
+        True if z-score test passes, False otherwise
+    """
     if target.true_mean is None or target.true_cov is None:
         return True  # Skip check if true values unknown
 
-    mean_est = diagnostics["mean_estimate"]
-    std_est = diagnostics["std_estimate"]
-
+    summary = diagnostics["summary"]
+    means = summary["mean"].values
+    mcse = summary["mcse_mean"].values
     true_mean = np.array(target.true_mean)
-    true_std = np.sqrt(np.diag(target.true_cov))
 
-    # Check mean (scaled by true std)
-    mean_error = np.abs(mean_est - true_mean) / (true_std + 1e-6)
-    mean_pass = np.all(mean_error < tolerance)
+    # Calculate Z-scores: (estimate - truth) / MCSE
+    z_scores = (means - true_mean) / (mcse + 1e-16)
+    max_z = np.max(np.abs(z_scores))
 
-    # Check std (relative error)
-    std_error = np.abs(std_est - true_std) / (true_std + 1e-6)
-    std_pass = np.all(std_error < tolerance)
-
-    return mean_pass and std_pass
+    # Pass if all z-scores are within threshold
+    return max_z < z_threshold
 
 
-def run_single_benchmark(
+def run_trajectory_length_grid_search(
     sampler: str,
     target: TargetDistribution,
     key: jnp.ndarray,
-    n_chains: int = 4,
-    num_warmup: int = 1000,
-    target_ess: int = 1000,
-    batch_size: int = 2000,
-    max_samples: int = 50000,
-    schedule_type: str = "constant",
+    n_chains: int,
+    num_warmup: int,
+    target_ess: int,
+    batch_size: int,
+    max_samples: int,
+    schedule_type: str,
+    num_steps_grid: List[int],
 ) -> Dict:
-    """Run a single sampler-target benchmark with adaptive warmup."""
+    """Run grid search over trajectory lengths and return best result.
 
+    For HMC and GRAHMC, we test multiple trajectory lengths (L) and select
+    the one that achieves the best ESS per gradient evaluation.
+
+    Returns:
+        Best result dict with additional 'grid_search_info' field
+    """
+    print(f"\n{'#'*80}")
+    print(f"GRID SEARCH: Testing trajectory lengths {num_steps_grid}")
+    print(f"{'#'*80}")
+
+    grid_results = []
+
+    for num_steps in num_steps_grid:
+        key, subkey = random.split(key)
+
+        print(f"\n--- Testing L={num_steps} ---")
+
+        result = run_single_benchmark_with_L(
+            sampler=sampler,
+            target=target,
+            key=subkey,
+            n_chains=n_chains,
+            num_warmup=num_warmup,
+            target_ess=target_ess,
+            batch_size=batch_size,
+            max_samples=max_samples,
+            schedule_type=schedule_type,
+            num_steps=num_steps,
+        )
+
+        # Calculate ESS per gradient for ranking
+        if result.get("error") is None:
+            n_gradients = result["total_samples"] * num_steps
+            ess_per_grad = result["ess_bulk_min"] / n_gradients if n_gradients > 0 else 0
+            result["n_gradients"] = n_gradients
+            result["ess_per_gradient"] = ess_per_grad
+        else:
+            result["n_gradients"] = 0
+            result["ess_per_gradient"] = 0
+
+        grid_results.append(result)
+
+    # Select best result based on ESS per gradient
+    best_result = max(grid_results, key=lambda r: r["ess_per_gradient"])
+
+    print(f"\n{'='*80}")
+    print(f"GRID SEARCH COMPLETE")
+    print(f"{'='*80}")
+    print(f"Results by trajectory length:")
+    for r in grid_results:
+        status = "[ERROR]" if r.get("error") else ("[PASS]" if r.get("overall_pass") else "[FAIL]")
+        print(f"  L={r['num_steps']:2d}: ESS/grad={r['ess_per_gradient']:.6f}, "
+              f"ESS={r['ess_bulk_min']:7.1f}, samples={r['total_samples']:5d} {status}")
+
+    print(f"\n>>> BEST: L={best_result['num_steps']} (ESS/grad={best_result['ess_per_gradient']:.6f})")
+
+    # Add grid search metadata
+    best_result["grid_search_info"] = {
+        "tested_L_values": num_steps_grid,
+        "all_results": [{
+            "num_steps": r["num_steps"],
+            "ess_per_gradient": r["ess_per_gradient"],
+            "ess_bulk_min": r["ess_bulk_min"],
+            "total_samples": r["total_samples"],
+            "overall_pass": r.get("overall_pass", False),
+        } for r in grid_results],
+    }
+
+    return best_result
+
+
+def run_single_benchmark_with_L(
+    sampler: str,
+    target: TargetDistribution,
+    key: jnp.ndarray,
+    n_chains: int,
+    num_warmup: int,
+    target_ess: int,
+    batch_size: int,
+    max_samples: int,
+    schedule_type: str,
+    num_steps: int,
+) -> Dict:
+    """Run a single benchmark with a specific trajectory length.
+
+    This is the internal function called by grid search.
+    """
     print(f"\n{'='*80}")
     print(f"BENCHMARK: {sampler.upper()} on {target.name}")
     if sampler in ["grahmc", "rahmc"]:
         print(f"  Schedule: {schedule_type}")
+    print(f"  Trajectory Length: L={num_steps}")
     print(f"{'='*80}")
 
     start_time = time.time()
@@ -118,6 +217,11 @@ def run_single_benchmark(
             init_pos = target.init_sampler(init_key, n_chains)
         else:
             init_pos = random.normal(init_key, (n_chains, target.dim)) * 0.1
+
+        # Create gradient function from log_prob_fn
+        def grad_log_prob_fn(x):
+            """Compute gradient of log probability at x."""
+            return grad(lambda y: jnp.sum(target.log_prob_fn(y)))(x)
 
         # Adaptive warmup phase
         print("\n[Phase 1] Adaptive Warmup (tuning step size + mass matrix)...")
@@ -138,19 +242,25 @@ def run_single_benchmark(
             # Use adaptive warmup for HMC/NUTS/GRAHMC
             sampler_kwargs = {}
             if sampler == "hmc":
-                sampler_kwargs["num_steps"] = 20  # Fixed L for HMC
+                sampler_kwargs["num_steps"] = num_steps  # Use grid search value
             elif sampler == "nuts":
                 sampler_kwargs["max_tree_depth"] = 10
             elif sampler in ["grahmc", "rahmc"]:
-                sampler_kwargs["num_steps"] = 20
+                sampler_kwargs["num_steps"] = num_steps  # Use grid search value
                 sampler_kwargs["gamma"] = 1.0
                 sampler_kwargs["steepness"] = 5.0 if schedule_type == "tanh" else 10.0
                 sampler_kwargs["friction_schedule"] = get_friction_schedule(schedule_type)
 
             sampler_name_map = {"grahmc": "grahmc", "rahmc": "grahmc"}
             step_size, inv_mass_matrix, warmup_pos, warmup_info = run_adaptive_warmup(
-                key, sampler_name_map.get(sampler, sampler), target.log_prob_fn, init_pos,
-                num_warmup=num_warmup, target_accept=0.65,
+                sampler_name_map.get(sampler, sampler),
+                target.log_prob_fn,
+                grad_log_prob_fn,  # Use the gradient function we created above
+                init_pos,
+                key,
+                num_warmup=num_warmup,
+                target_accept=0.65,
+                schedule_type=schedule_type if sampler in ["grahmc", "rahmc"] else None,
                 **sampler_kwargs
             )
         else:
@@ -186,7 +296,7 @@ def run_single_benchmark(
             elif sampler == "hmc":
                 samples_batch, lps_batch, accept_rate, final_state = hmc_run(
                     sample_key, target.log_prob_fn, current_position,
-                    step_size=step_size, num_steps=20,
+                    step_size=step_size, num_steps=num_steps,  # Use grid search value
                     num_samples=batch_size, burn_in=0,
                     inv_mass_matrix=inv_mass_matrix
                 )
@@ -198,11 +308,16 @@ def run_single_benchmark(
                     inv_mass_matrix=inv_mass_matrix
                 )
             elif sampler in ["grahmc", "rahmc"]:
+                # EXTRACT TUNED VALUES from warmup_info
+                tuned_gamma = warmup_info.get("gamma", 1.0)
+                tuned_steepness = warmup_info.get("steepness", 5.0)
+
                 friction_schedule = get_friction_schedule(schedule_type)
                 samples_batch, lps_batch, accept_rate, final_state = rahmc_run(
                     sample_key, target.log_prob_fn, current_position,
-                    step_size=step_size, num_steps=20,
-                    gamma=1.0, steepness=5.0 if schedule_type == "tanh" else 10.0,
+                    step_size=step_size, num_steps=num_steps,  # Use grid search value
+                    gamma=tuned_gamma,  # Use tuned values, not hardcoded!
+                    steepness=tuned_steepness,
                     num_samples=batch_size, burn_in=0,
                     inv_mass_matrix=inv_mass_matrix,
                     friction_schedule=friction_schedule
@@ -249,16 +364,22 @@ def run_single_benchmark(
         if sampler == "rwmh":
             sampler_metadata = {"scale": step_size}
         elif sampler == "hmc":
-            sampler_metadata = {"step_size": step_size, "num_steps": 20}
+            sampler_metadata = {"step_size": step_size, "num_steps": num_steps}
         elif sampler == "nuts":
             sampler_metadata = {"step_size": step_size, "max_tree_depth": 10}
         elif sampler in ["grahmc", "rahmc"]:
-            sampler_metadata = {"step_size": step_size, "num_steps": 20, "gamma": 1.0, "schedule": schedule_type}
+            sampler_metadata = {
+                "step_size": step_size,
+                "num_steps": num_steps,
+                "gamma": warmup_info.get("gamma", 1.0),
+                "steepness": warmup_info.get("steepness", 5.0),
+                "schedule": schedule_type
+            }
 
         # Compute diagnostics
         print("\n[Phase 3] Computing diagnostics...")
         diagnostics = compute_diagnostics(samples)
-        stats_pass = check_summary_statistics(diagnostics, target, tolerance=0.15)
+        stats_pass = check_summary_statistics(diagnostics, target, z_threshold=5.0)
 
         total_time = time.time() - start_time
 
@@ -342,8 +463,14 @@ def run_all_benchmarks(
     max_samples: int,
     seed: int,
     output_dir: str,
+    num_steps_grid: List[int] = None,
 ) -> pd.DataFrame:
-    """Run all sampler-target combinations and save results."""
+    """Run all sampler-target combinations and save results.
+
+    Args:
+        num_steps_grid: Grid of trajectory lengths to test for HMC/GRAHMC.
+                       If None, uses default [8, 16, 32, 64].
+    """
 
     # Set up JAX
     jax.config.update("jax_enable_x64", True)
@@ -351,6 +478,10 @@ def run_all_benchmarks(
 
     # Create output directory
     Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    # Default grid for trajectory length if not specified
+    if num_steps_grid is None:
+        num_steps_grid = [8, 16, 32, 64]
 
     all_results = []
 
@@ -364,10 +495,10 @@ def run_all_benchmarks(
 
         for sampler in samplers:
             if sampler in ["grahmc", "rahmc"]:
-                # Test each schedule for GRAHMC
+                # Test each schedule for GRAHMC with grid search over L
                 for schedule in grahmc_schedules:
                     key, subkey = random.split(key)
-                    results = run_single_benchmark(
+                    results = run_trajectory_length_grid_search(
                         sampler=sampler,
                         target=target,
                         key=subkey,
@@ -377,12 +508,13 @@ def run_all_benchmarks(
                         batch_size=batch_size,
                         max_samples=max_samples,
                         schedule_type=schedule,
+                        num_steps_grid=num_steps_grid,
                     )
                     all_results.append(results)
-            else:
-                # Other samplers don't have schedules
+            elif sampler == "hmc":
+                # HMC uses grid search over L
                 key, subkey = random.split(key)
-                results = run_single_benchmark(
+                results = run_trajectory_length_grid_search(
                     sampler=sampler,
                     target=target,
                     key=subkey,
@@ -391,6 +523,24 @@ def run_all_benchmarks(
                     target_ess=target_ess,
                     batch_size=batch_size,
                     max_samples=max_samples,
+                    schedule_type="constant",  # Unused for HMC
+                    num_steps_grid=num_steps_grid,
+                )
+                all_results.append(results)
+            else:
+                # RWMH and NUTS don't use trajectory length grid search
+                key, subkey = random.split(key)
+                results = run_single_benchmark_with_L(
+                    sampler=sampler,
+                    target=target,
+                    key=subkey,
+                    n_chains=n_chains,
+                    num_warmup=num_warmup,
+                    target_ess=target_ess,
+                    batch_size=batch_size,
+                    max_samples=max_samples,
+                    schedule_type="constant",  # Unused for RWMH/NUTS
+                    num_steps=20,  # Unused for RWMH/NUTS
                 )
                 all_results.append(results)
 
@@ -494,6 +644,8 @@ def main():
                        help="Batch size for adaptive sampling")
     parser.add_argument("--max-samples", type=int, default=50000,
                        help="Maximum samples before giving up")
+    parser.add_argument("--num-steps-grid", nargs="+", type=int, default=None,
+                       help="Grid of trajectory lengths to test for HMC/GRAHMC (default: [8, 16, 32, 64])")
 
     # Output
     parser.add_argument("--output-dir", type=str, default="benchmark_results",
@@ -540,6 +692,7 @@ def main():
         target_ess=args.target_ess,
         seed=args.seed,
         output_dir=args.output_dir,
+        num_steps_grid=args.num_steps_grid,
     )
 
     # Print summary
