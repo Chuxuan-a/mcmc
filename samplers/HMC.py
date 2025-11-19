@@ -91,6 +91,7 @@ def leapfrog(
     grad_log_prob: Array,
     log_prob_fn: LogProbFn,
     num_steps: int,
+    inv_mass_matrix: Array,
 ) -> Tuple[Array, Array, Array, Array]:
     """Perform leapfrog integration for Hamiltonian dynamics.
 
@@ -102,6 +103,7 @@ def leapfrog(
         grad_log_prob: Current gradients of log prob, shape (n_chains, n_dim)
         log_prob_fn: Function to compute log probability and gradient
         num_steps: Number of leapfrog steps
+        inv_mass_matrix: Inverse of mass matrix (vector of diagonal), shape (n_dim,)
 
     Returns:
         Tuple of (final_position, final_momentum, final_grad_log_prob, final_log_prob)
@@ -115,8 +117,8 @@ def leapfrog(
         pos, mom, lp, grad_lp = carry
         # Half step for momentum
         mom = mom + half * step_sz * grad_lp
-        # Full step for position
-        pos = pos + step_sz * mom
+        # Full step for position, using velocity = M_inv * p
+        pos = pos + step_sz * (mom * inv_mass_matrix)
         # Update gradient at new position
         new_lp, new_grad_lp = vmap(jax.value_and_grad(log_prob_fn))(pos)
         new_lp = new_lp.astype(lp_dtype)
@@ -139,6 +141,7 @@ def hmc_step(
     step_size: float,
     num_steps: int,
     key: Array,
+    inv_mass_matrix: Array,
     return_proposal: bool = False,
 ) -> Tuple[Array, HMCState] | Tuple[Array, HMCState, Array, Array, Array]:
     """Perform one HMC step with Metropolis-Hastings acceptance.
@@ -149,6 +152,7 @@ def hmc_step(
         step_size: Leapfrog integration step size
         num_steps: Number of leapfrog steps
         key: JAX random key
+        inv_mass_matrix: Inverse of mass matrix (vector of diagonal), shape (n_dim,)
         return_proposal: If True, return proposal info for diagnostics
 
     Returns:
@@ -159,14 +163,17 @@ def hmc_step(
     pos_dtype = state.position.dtype
     logprob_dtype = state.log_prob.dtype
 
-    # next_key, k_momentum, k_accept = random.split(key, 3)
     key, step_key = random.split(key)
     k_momentum, k_accept = random.split(step_key, 2)
 
-    momentum = random.normal(k_momentum, shape=(n_chains, n_dim), dtype=pos_dtype)
+    # Sample momentum from N(0, M) using cholesky M = L L^T. p = L z where z ~ N(0, I).
+    # For diagonal M, p_i = sqrt(m_i) z_i => p ~ N(0, diag(m_i)).
+    # So we sample from N(0, I) and scale by M^{1/2} = diag(1/sqrt(w_i)).
+    momentum = random.normal(k_momentum, shape=(n_chains, n_dim), dtype=pos_dtype) / jnp.sqrt(inv_mass_matrix)
     step_size_arr = jnp.asarray(step_size, dtype=pos_dtype)
 
-    kinetic_initial = 0.5 * jnp.sum(momentum**2, axis=-1)
+    # Kinetic energy is 0.5 * p^T M^{-1} p
+    kinetic_initial = 0.5 * jnp.sum(momentum**2 * inv_mass_matrix, axis=-1)
     hamiltonian_initial = -state.log_prob + kinetic_initial.astype(logprob_dtype)
 
     current_position = state.position
@@ -181,11 +188,12 @@ def hmc_step(
         grad_lp,
         log_prob_fn=log_prob_fn,
         num_steps=num_steps,
+        inv_mass_matrix=inv_mass_matrix,
     )
 
-    momentum = -momentum 
+    momentum = -momentum
 
-    kinetic_final = 0.5 * jnp.sum(momentum**2, axis=-1)
+    kinetic_final = 0.5 * jnp.sum(momentum**2 * inv_mass_matrix, axis=-1)
     hamiltonian_final = -log_prob + kinetic_final.astype(logprob_dtype)
     # overflow protection
     hamiltonian_final = jnp.where(jnp.isfinite(hamiltonian_final), hamiltonian_final, jnp.array(1e10, dtype=logprob_dtype))
@@ -220,6 +228,7 @@ def hmc_run(
     num_steps: int,
     num_samples: int,
     burn_in: int = 0,
+    inv_mass_matrix: Optional[Array] = None,
     track_proposals: bool = False,
 ) -> Tuple:
     """Run Hamiltonian Monte Carlo sampler with parallel chains.
@@ -232,6 +241,7 @@ def hmc_run(
         num_steps: Number of leapfrog steps per HMC iteration
         num_samples: Number of samples to collect (after burn-in)
         burn_in: Number of burn-in iterations (default: 0)
+        inv_mass_matrix: Inverse of mass matrix (vector of diagonal), defaults to ones.
         track_proposals: If True, return proposal tracking info for diagnostics (default: False)
 
     Returns:
@@ -250,12 +260,15 @@ def hmc_run(
     n_chains, n_dim = init_state.position.shape
     state = init_state
     step_size_arr = jnp.asarray(step_size, dtype=init_state.position.dtype)
-    
+
+    if inv_mass_matrix is None:
+        inv_mass_matrix = jnp.ones(n_dim, dtype=init_state.position.dtype)
+
     # Burn-in phase
     if burn_in > 0:
         def burn_body(carry, _):
             k, s = carry
-            k, s = hmc_step(s, log_prob_fn, step_size_arr, num_steps, k, return_proposal=False)
+            k, s = hmc_step(s, log_prob_fn, step_size_arr, num_steps, k, inv_mass_matrix, return_proposal=False)
             return (k, s), None
 
         (key, init_state), _ = lax.scan(burn_body, (key, init_state), length=burn_in)
@@ -276,7 +289,7 @@ def hmc_run(
             k, s = carry
             pre_pos, pre_lp = s.position, s.log_prob
             k, s, prop_pos, prop_lp, delta_H = hmc_step(
-                s, log_prob_fn, step_size_arr, num_steps, k, return_proposal=True
+                s, log_prob_fn, step_size_arr, num_steps, k, inv_mass_matrix, return_proposal=True
             )
             return (k, s), (pre_pos, pre_lp, prop_pos, prop_lp, delta_H, s.position, s.log_prob)
 
@@ -293,7 +306,7 @@ def hmc_run(
     else:
         def sample_body(carry, _):
             k, s = carry
-            k, s = hmc_step(s, log_prob_fn, step_size_arr, num_steps, k, return_proposal=False)
+            k, s = hmc_step(s, log_prob_fn, step_size_arr, num_steps, k, inv_mass_matrix, return_proposal=False)
             return (k, s), (s.position, s.log_prob)
 
         (key, state), (samples, lps) = lax.scan(sample_body, (key, state), length=num_samples)

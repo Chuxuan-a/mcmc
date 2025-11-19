@@ -15,7 +15,7 @@ Implementation inspired by BlackJAX's iterative (non-recursive) approach.
 """
 from __future__ import annotations
 from functools import partial
-from typing import Callable, Tuple, NamedTuple
+from typing import Callable, Tuple, NamedTuple, Optional
 import numpy as np
 
 import jax
@@ -93,6 +93,7 @@ def _leapfrog_step(
     grad: Array,
     epsilon: float,
     log_prob_fn: LogProbFn,
+    inv_mass_matrix: Array,
 ) -> Tuple[Array, Array, Array, Array]:
     """Perform one leapfrog integration step.
 
@@ -104,8 +105,8 @@ def _leapfrog_step(
 
     # Half step for momentum
     p = p + half * eps * grad
-    # Full step for position
-    q = q + eps * p
+    # Full step for position, using velocity = M_inv * p
+    q = q + eps * (p * inv_mass_matrix)
     # Recompute gradient
     log_prob_new, grad_new = jax.value_and_grad(log_prob_fn)(q)
     log_prob_new = jnp.asarray(log_prob_new, dtype=jnp.float64)
@@ -117,9 +118,9 @@ def _leapfrog_step(
 
 
 @jax.jit
-def _compute_energy(log_prob: float, p: Array) -> float:
-    """Compute Hamiltonian (total energy): H = -log_prob + 0.5 * ||p||^2"""
-    kinetic = 0.5 * jnp.sum(p**2)
+def _compute_energy(log_prob: float, p: Array, inv_mass_matrix: Array) -> float:
+    """Compute Hamiltonian (total energy): H = -log_prob + 0.5 * p^T M_inv p"""
+    kinetic = 0.5 * jnp.sum(p**2 * inv_mass_matrix)
     return -jnp.asarray(log_prob, dtype=jnp.float64) + jnp.asarray(kinetic, dtype=jnp.float64)
 
 
@@ -133,6 +134,7 @@ def _integrate_trajectory(
     num_steps: int,
     log_prob_fn: LogProbFn,
     h0: float,
+    inv_mass_matrix: Array,
 ) -> Tuple[Array, Array, Array, Array, float]:
     """Integrate trajectory for a given number of steps in a direction.
 
@@ -145,6 +147,7 @@ def _integrate_trajectory(
         num_steps: Number of leapfrog steps (can be dynamic)
         log_prob_fn: Log probability function
         h0: Initial energy (for computing acceptance probabilities)
+        inv_mass_matrix: Inverse mass matrix
 
     Returns:
         (q_final, p_final, lp_final, grad_final, sum_accept_prob)
@@ -159,9 +162,9 @@ def _integrate_trajectory(
     def integrate_steps(carry):
         def loop_body(i, carry):
             q, p, lp, grad, sum_alpha = carry
-            q, p, lp, grad = _leapfrog_step(q, p, grad, signed_epsilon, log_prob_fn)
+            q, p, lp, grad = _leapfrog_step(q, p, grad, signed_epsilon, log_prob_fn, inv_mass_matrix)
             # Compute acceptance probability at this step
-            h_new = _compute_energy(lp, p)
+            h_new = _compute_energy(lp, p, inv_mass_matrix)
             log_alpha = jnp.minimum(0.0, h0 - h_new)
             alpha = jnp.exp(log_alpha)
             return (q, p, lp, grad, sum_alpha + alpha)
@@ -194,17 +197,18 @@ def _nuts_step_single_chain(
     epsilon: float,
     max_tree_depth: int,
     delta_max: float,
+    inv_mass_matrix: Array,
 ) -> Tuple:
     """Perform one NUTS step for a single chain using iterative doubling.
 
     Returns: (q_new, lp_new, grad_new, accepted, tree_depth, mean_accept_prob)
     """
-    # Sample momentum
+    # Sample momentum from N(0, M)
     key, subkey = random.split(key)
-    p0 = random.normal(subkey, shape=q.shape, dtype=q.dtype)
+    p0 = random.normal(subkey, shape=q.shape, dtype=q.dtype) / jnp.sqrt(inv_mass_matrix)
 
     # Compute initial energy and slice threshold
-    h0 = _compute_energy(log_prob, p0)
+    h0 = _compute_energy(log_prob, p0, inv_mass_matrix)
     key, subkey = random.split(key)
     log_u = jnp.log(random.uniform(subkey, dtype=jnp.float64)) - h0
 
@@ -260,11 +264,11 @@ def _nuts_step_single_chain(
         # Build subtree with 2^depth steps
         num_steps = 2 ** depth
         q_new, p_new, lp_new, grad_new, sum_alpha_subtree = _integrate_trajectory(
-            q_start, p_start, grad_start, direction, epsilon, num_steps, log_prob_fn, h0
+            q_start, p_start, grad_start, direction, epsilon, num_steps, log_prob_fn, h0, inv_mass_matrix
         )
 
         # Check validity and divergence
-        h_new = _compute_energy(lp_new, p_new)
+        h_new = _compute_energy(lp_new, p_new, inv_mass_matrix)
         in_slice = log_u <= -h_new
         is_divergent = (h_new - h0) > delta_max
         is_valid = in_slice & (~is_divergent)
@@ -380,13 +384,13 @@ def _nuts_step_single_chain(
     return (final_traj.q_proposal, final_traj.lp_proposal, final_traj.grad_proposal,
             accepted, final_depth, mean_accept_prob)
 
-
 @partial(jax.jit, static_argnames=("log_prob_fn", "max_tree_depth"))
 def nuts_step(
     state: NUTSState,
     log_prob_fn: LogProbFn,
     step_size: float,
     key: Array,
+    inv_mass_matrix: Array,
     max_tree_depth: int = 10,
     delta_max: float = 1000.0,
 ) -> Tuple[Array, NUTSState, Array, Array]:
@@ -410,6 +414,7 @@ def nuts_step(
             step_size,
             max_tree_depth,
             delta_max,
+            inv_mass_matrix,
         )
 
     # Vectorize over chains
@@ -434,6 +439,7 @@ def nuts_run(
     step_size: float,
     num_samples: int,
     burn_in: int = 0,
+    inv_mass_matrix: Optional[Array] = None,
     max_tree_depth: int = 10,
     delta_max: float = 1000.0,
 ) -> Tuple[Array, Array, Array, NUTSState, Array]:
@@ -446,6 +452,7 @@ def nuts_run(
         step_size: Leapfrog integration step size
         num_samples: Number of samples to collect (after burn-in)
         burn_in: Number of burn-in iterations (default: 0)
+        inv_mass_matrix: Inverse of mass matrix (vector of diagonal), defaults to ones.
         max_tree_depth: Maximum tree depth (default: 10, max trajectory = 2^10 = 1024 steps)
         delta_max: Maximum energy change before flagging divergence (default: 1000.0)
 
@@ -459,13 +466,16 @@ def nuts_run(
         - mean_accept_probs: Mean Metropolis acceptance probs from trajectories, shape (num_samples, n_chains)
     """
     state = nuts_init(init_position, log_prob_fn)
-    n_chains = state.position.shape[0]
+    n_chains, n_dim = state.position.shape
+
+    if inv_mass_matrix is None:
+        inv_mass_matrix = jnp.ones(n_dim, dtype=state.position.dtype)
 
     # Burn-in phase
     if burn_in > 0:
         def burn_body(carry, _):
             k, s = carry
-            k, s, _, _ = nuts_step(s, log_prob_fn, step_size, k, max_tree_depth, delta_max)
+            k, s, _, _ = nuts_step(s, log_prob_fn, step_size, k, inv_mass_matrix, max_tree_depth, delta_max)
             return (k, s), None
 
         (key, state), _ = lax.scan(burn_body, (key, state), jnp.arange(burn_in))
@@ -481,7 +491,7 @@ def nuts_run(
     # Sampling phase
     def sample_body(carry, _):
         k, s = carry
-        k, s, depths, mean_accept_probs = nuts_step(s, log_prob_fn, step_size, k, max_tree_depth, delta_max)
+        k, s, depths, mean_accept_probs = nuts_step(s, log_prob_fn, step_size, k, inv_mass_matrix, max_tree_depth, delta_max)
         return (k, s), (s.position, s.log_prob, depths, mean_accept_probs)
 
     (key, state), (samples, log_probs, tree_depths, mean_accept_probs) = lax.scan(

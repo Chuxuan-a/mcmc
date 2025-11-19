@@ -270,6 +270,144 @@ def log_gamma(dim: int = 10, shape: float = 2.0, rate: float = 1.0) -> TargetDis
     )
 
 
+def student_t(dim: int = 10, df: float = 3.0) -> TargetDistribution:
+    """
+    Independent Student-t distribution with specified degrees of freedom.
+
+    Structure:
+        x_i ~ Student-t(df) for all i
+        log p(x) = sum_i [log(Gamma((df+1)/2)) - log(Gamma(df/2)) - 0.5*log(df*pi)
+                         - ((df+1)/2)*log(1 + x_i^2/df)]
+
+    Tests: Heavy tails, non-Gaussian geometry, robustness to outliers.
+    The heavy tails make this challenging for Gaussian-based proposals.
+
+    Why df=3:
+    - df=3 has finite variance (Var = df/(df-2) = 3) but infinite 4th moment
+    - Creates significant heavy tails while remaining tractable
+    - HMC/NUTS struggle with heavy tails (overshooting into low-density regions)
+    - GRAHMC's friction can help control momentum in the tails
+
+    Args:
+        dim: Dimensionality
+        df: Degrees of freedom (nu > 2 for finite variance, nu=3 recommended)
+
+    Returns:
+        TargetDistribution with Student-t log probability.
+    """
+    from jax.scipy.special import gammaln
+
+    def log_prob_fn(x):
+        # Student-t log pdf: log(Γ((ν+1)/2)) - log(Γ(ν/2)) - 0.5*log(νπ) - ((ν+1)/2)*log(1 + x²/ν)
+        log_normalizer = gammaln((df + 1.0) / 2.0) - gammaln(df / 2.0) - 0.5 * jnp.log(df * jnp.pi)
+
+        if x.ndim == 1:
+            log_kernel = -((df + 1.0) / 2.0) * jnp.log(1.0 + x**2 / df)
+            result = jnp.sum(log_normalizer + log_kernel)
+        else:
+            log_kernel = -((df + 1.0) / 2.0) * jnp.log(1.0 + x**2 / df)
+            result = jnp.sum(log_normalizer + log_kernel, axis=-1)
+
+        return result
+
+    def init_sampler(key, n_chains):
+        """Initialize with overdispersed samples to cover heavy tails."""
+        # Use wider initialization (std=2) to better cover the heavy-tailed distribution
+        return random.normal(key, (n_chains, dim)) * 2.0
+
+    # True moments for Student-t with df > 2
+    true_mean = jnp.zeros(dim)
+    if df > 2:
+        true_var = df / (df - 2.0)  # For df=3: var = 3
+        true_cov = jnp.eye(dim) * true_var
+    else:
+        true_cov = None  # Variance doesn't exist for df <= 2
+
+    return TargetDistribution(
+        log_prob_fn=log_prob_fn,
+        dim=dim,
+        true_mean=true_mean,
+        true_cov=true_cov,
+        name=f"StudentT{dim}D_df{df}",
+        description=f"{dim}D independent Student-t(df={df}) - tests heavy tails and non-Gaussian geometry",
+        init_sampler=init_sampler
+    )
+
+
+def rosenbrock(dim: int = 10, scale: float = 0.1) -> TargetDistribution:
+    """
+    Rosenbrock density: challenging non-Gaussian with curved valley.
+
+    Structure (negative Rosenbrock as potential):
+        U(x) = sum_{i=1}^{D-1} [(1-x_i)^2 + (1/scale^2)*(x_{i+1} - x_i^2)^2]
+        log p(x) = -U(x)
+
+    Tests: Curved ridges, non-linear correlations, momentum direction adaptation.
+    The narrow curved valley requires precise momentum control.
+
+    Why scale=0.1:
+    - Creates a narrow curved valley (smaller scale = narrower valley)
+    - Curvature is challenging for fixed mass matrix adaptation
+    - The optimal path is x_i = x_{i-1}^2, a parabola
+    - HMC/NUTS with mass matrix can learn the width but not the curvature
+    - GRAHMC's time-varying friction can better navigate the curved geometry
+
+    Technical notes:
+    - Minimum at x* = (1, 1, ..., 1) with log p(x*) = 0
+    - For scale=0.1, typical width ~ 0.1 perpendicular to valley
+    - Valley curvature creates position-dependent geometry (similar to funnel)
+
+    Args:
+        dim: Dimensionality (recommended: 5-20)
+        scale: Valley width parameter (smaller = narrower, harder)
+
+    Returns:
+        TargetDistribution with Rosenbrock log probability.
+    """
+    def log_prob_fn(x):
+        # Rosenbrock function as negative log probability
+        # U(x) = sum [(1-x_i)^2 + a*(x_{i+1} - x_i^2)^2] where a = 1/scale^2
+        a = 1.0 / (scale ** 2)
+
+        if x.ndim == 1:
+            x_current = x[:-1]
+            x_next = x[1:]
+            term1 = (1.0 - x_current) ** 2
+            term2 = a * (x_next - x_current ** 2) ** 2
+            U = jnp.sum(term1 + term2)
+        else:
+            # Batched: (n_chains, dim)
+            x_current = x[:, :-1]
+            x_next = x[:, 1:]
+            term1 = (1.0 - x_current) ** 2
+            term2 = a * (x_next - x_current ** 2) ** 2
+            U = jnp.sum(term1 + term2, axis=-1)
+
+        # Return negative potential as log probability
+        return -U
+
+    def init_sampler(key, n_chains):
+        """Initialize near the mode (1, 1, ..., 1) with small perturbations."""
+        # Start near the global minimum x* = (1, 1, ..., 1)
+        # Add small noise to explore the valley
+        return jnp.ones((n_chains, dim)) + random.normal(key, (n_chains, dim)) * 0.5
+
+    # True moments are not analytically tractable (unnormalized density)
+    # But we know the mode is at (1, 1, ..., 1)
+    true_mean = jnp.ones(dim)  # Approximate (mode as proxy)
+    true_cov = None  # Not analytically available
+
+    return TargetDistribution(
+        log_prob_fn=log_prob_fn,
+        dim=dim,
+        true_mean=true_mean,
+        true_cov=true_cov,
+        name=f"Rosenbrock{dim}D_scale{scale}",
+        description=f"{dim}D Rosenbrock(scale={scale}) - tests curved valleys and non-linear geometry",
+        init_sampler=init_sampler
+    )
+
+
 def gaussian_mixture(dim: int = 10, n_modes: int = 2, separation: float = 5.0) -> TargetDistribution:
     """
     Mixture of Gaussians in 1D with remaining dimensions independent.
@@ -354,8 +492,8 @@ def get_target(name: str, dim: int = 10, **kwargs) -> TargetDistribution:
 
     Args:
         name: One of ['standard_normal', 'correlated_gaussian',
-                      'ill_conditioned_gaussian', 'neals_funnel',
-                      'log_gamma', 'gaussian_mixture']
+                      'ill_conditioned_gaussian', 'student_t', 'log_gamma',
+                      'rosenbrock', 'neals_funnel', 'gaussian_mixture']
         dim: Dimensionality for the target.
         **kwargs: Additional arguments passed to target factory.
 
@@ -366,8 +504,10 @@ def get_target(name: str, dim: int = 10, **kwargs) -> TargetDistribution:
         'standard_normal': standard_normal,
         'correlated_gaussian': correlated_gaussian,
         'ill_conditioned_gaussian': ill_conditioned_gaussian,
-        'neals_funnel': neals_funnel,
+        'student_t': student_t,
         'log_gamma': log_gamma,
+        'rosenbrock': rosenbrock,
+        'neals_funnel': neals_funnel,
         'gaussian_mixture': gaussian_mixture,
     }
 
@@ -383,8 +523,10 @@ def list_targets():
         standard_normal(10),
         correlated_gaussian(10),
         ill_conditioned_gaussian(10),
-        neals_funnel(10),
+        student_t(10),
         log_gamma(10),
+        rosenbrock(10),
+        neals_funnel(10),
         gaussian_mixture(10),
     ]
 

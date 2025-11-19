@@ -13,7 +13,7 @@ Based on "Repelling-Attracting Hamiltonian Monte Carlo" (Vishwanath & Tak, 2024)
 The constant schedule corresponds to the original RAHMC algorithm.
 """
 from __future__ import annotations
-from typing import Callable, Dict, Tuple, NamedTuple
+from typing import Callable, Dict, Tuple, NamedTuple, Optional
 import numpy as np
 import arviz as az
 import matplotlib.pyplot as plt
@@ -157,13 +157,14 @@ def _conformal_leapfrog_step(
     log_prob: Array,
     grad_log_prob: Array,
     log_prob_fn: LogProbFn,
+    inv_mass_matrix: Array,
 ):
     """Perform one conformal leapfrog step with friction.
 
     Implements the conformal symplectic integrator:
     1. Apply friction scaling: p *= exp(-γε/2)
     2. Half momentum kick: p += (ε/2) * ∇log p(q)
-    3. Position update: q += ε * p
+    3. Position update: q += ε * M_inv * p
     4. Recompute gradient at new position
     5. Half momentum kick: p += (ε/2) * ∇log p(q')
     6. Apply friction scaling: p *= exp(-γε/2)
@@ -179,6 +180,7 @@ def _conformal_leapfrog_step(
         log_prob: Current log probabilities, shape (n_chains,)
         grad_log_prob: Current gradients, shape (n_chains, n_dim)
         log_prob_fn: Function to compute log probability and gradient
+        inv_mass_matrix: Inverse of mass matrix (vector of diagonal), shape (n_dim,)
 
     Returns:
         Tuple of (new_position, new_momentum, new_log_prob, new_grad_log_prob)
@@ -196,7 +198,7 @@ def _conformal_leapfrog_step(
     # half kick
     momentum = momentum + half_eps * grad_log_prob
     # drift
-    position = position + eps * momentum
+    position = position + eps * (momentum * inv_mass_matrix)
     # refresh grads
     new_lp, new_grad_lp = vmap(jax.value_and_grad(log_prob_fn))(position)
     new_lp = new_lp.astype(lp_dtype)
@@ -221,6 +223,7 @@ def _trajectory_with_schedule(
     num_steps: int,
     log_prob_fn: LogProbFn,
     friction_schedule: FrictionScheduleFn,
+    inv_mass_matrix: Array,
 ):
     """Run a full leapfrog trajectory with time-dependent friction schedule.
 
@@ -235,6 +238,7 @@ def _trajectory_with_schedule(
         num_steps: Number of leapfrog steps
         log_prob_fn: Function to compute log probability and gradient
         friction_schedule: Friction schedule function
+        inv_mass_matrix: Inverse of mass matrix (vector of diagonal)
 
     Returns:
         Tuple of (final_position, final_momentum, final_log_prob, final_grad_log_prob)
@@ -247,7 +251,7 @@ def _trajectory_with_schedule(
         current_time = step_idx * step_size
         gamma_t = friction_schedule(current_time, total_time, gamma_max, steepness)
         q, p, lp, glp = _conformal_leapfrog_step(
-            q, p, step_size, gamma_t, lp, glp, log_prob_fn
+            q, p, step_size, gamma_t, lp, glp, log_prob_fn, inv_mass_matrix
         )
         return (q, p, lp, glp), None
 
@@ -266,6 +270,7 @@ def rahmc_step(
     steepness: float,
     key: Array,
     log_prob_fn: LogProbFn,
+    inv_mass_matrix: Array,
     friction_schedule: FrictionScheduleFn = None,
     return_proposal: bool = False,
 ) -> Tuple[Array, RAHMCState]:
@@ -279,6 +284,7 @@ def rahmc_step(
         steepness: Transition sharpness parameter
         key: JAX random key
         log_prob_fn: Function to compute log probability and gradient
+        inv_mass_matrix: Inverse of mass matrix (vector of diagonal)
         friction_schedule: Friction schedule function (default: constant_schedule)
         return_proposal: If True, return proposal info for diagnostics
 
@@ -293,29 +299,30 @@ def rahmc_step(
     pos_dtype = state.position.dtype
     logprob_dtype = state.log_prob.dtype
 
-    # next_key, k_mom, k_acc = random.split(key, 3)
     key, step_key = random.split(key)
     k_mom, k_acc = random.split(step_key, 2)
 
-    p0 = random.normal(k_mom, shape=(n_chains, n_dim), dtype=pos_dtype)
+    # Sample momentum from N(0, M)
+    p0 = random.normal(k_mom, shape=(n_chains, n_dim), dtype=pos_dtype) / jnp.sqrt(inv_mass_matrix)
 
-    kin0 = 0.5 * jnp.sum(p0**2, axis=-1) # JAX will broadcast to the right type
+    # Kinetic energy is 0.5 * p^T M^{-1} p
+    kin0 = 0.5 * jnp.sum(p0**2 * inv_mass_matrix, axis=-1)
     H0 = -state.log_prob + kin0.astype(logprob_dtype)
-
-    total_time = step_size * num_steps
 
     q, p, lp, glp = _trajectory_with_schedule(
         state.position, p0, step_size, gamma_max, steepness,
         state.log_prob, state.grad_log_prob,
-        num_steps, 
-        log_prob_fn=log_prob_fn, friction_schedule=friction_schedule,
+        num_steps,
+        log_prob_fn=log_prob_fn,
+        friction_schedule=friction_schedule,
+        inv_mass_matrix=inv_mass_matrix,
     )
 
     # flip momentum
     p = -p
 
     # compute final energies
-    kin1 = 0.5 * jnp.sum(p**2, axis=-1)
+    kin1 = 0.5 * jnp.sum(p**2 * inv_mass_matrix, axis=-1)
     H1 = -lp + kin1.astype(logprob_dtype)
     # add overflow protection
     H1 = jnp.where(jnp.isfinite(H1), H1, jnp.array(1e10, dtype=logprob_dtype))
@@ -335,7 +342,7 @@ def rahmc_step(
     new_acc = state.accept_count + accept.astype(jnp.int32)
 
     new_state = RAHMCState(new_pos, new_lp, new_glp, new_acc)
-    
+
     if return_proposal:
         return key, new_state, q, lp, delta_H
     else:
@@ -353,6 +360,7 @@ def rahmc_run(
     steepness: float,
     num_samples: int,
     burn_in: int = 0,
+    inv_mass_matrix: Optional[Array] = None,
     friction_schedule: FrictionScheduleFn = None,
     track_proposals: bool = False,
 ) -> Tuple:
@@ -368,6 +376,7 @@ def rahmc_run(
         steepness: Transition sharpness parameter (for tanh/sigmoid schedules)
         num_samples: Number of samples to collect (after burn-in)
         burn_in: Number of burn-in iterations (default: 0)
+        inv_mass_matrix: Inverse of mass matrix (vector of diagonal), defaults to ones.
         friction_schedule: Friction schedule function (default: constant_schedule)
         track_proposals: If True, return proposal tracking info for diagnostics (default: False)
 
@@ -387,7 +396,10 @@ def rahmc_run(
         friction_schedule = constant_schedule
 
     state = rahmc_init(init_position, log_prob_fn)
-    n_chains = state.position.shape[0]
+    n_chains, n_dim = state.position.shape
+
+    if inv_mass_matrix is None:
+        inv_mass_matrix = jnp.ones(n_dim, dtype=state.position.dtype)
 
     pos_type = state.position.dtype
 
@@ -400,7 +412,7 @@ def rahmc_run(
     if burn_in > 0:
         def burn_body(carry, _):
             k, s = carry
-            k, s = rahmc_step(s, eps, num_steps, gam, steep, k, log_prob_fn, friction_schedule, return_proposal=False)
+            k, s = rahmc_step(s, eps, num_steps, gam, steep, k, log_prob_fn, inv_mass_matrix, friction_schedule, return_proposal=False)
             return (k, s), None
         (key, state), _ = lax.scan(burn_body, (key, state), length=burn_in)
         # reset accept counter instead of manually reconstructing state
@@ -412,7 +424,7 @@ def rahmc_run(
             k, s = carry
             pre_pos, pre_lp = s.position, s.log_prob
             k, s, prop_pos, prop_lp, delta_H = rahmc_step(
-                s, eps, num_steps, gam, steep, k, log_prob_fn, friction_schedule, return_proposal=True
+                s, eps, num_steps, gam, steep, k, log_prob_fn, inv_mass_matrix, friction_schedule, return_proposal=True
             )
             return (k, s), (pre_pos, pre_lp, prop_pos, prop_lp, delta_H, s.position, s.log_prob)
         
@@ -435,7 +447,7 @@ def rahmc_run(
     else:
         def body(carry, _):
             k, s = carry
-            k, s = rahmc_step(s, eps, num_steps, gam, steep, k, log_prob_fn, friction_schedule, return_proposal=False)
+            k, s = rahmc_step(s, eps, num_steps, gam, steep, k, log_prob_fn, inv_mass_matrix, friction_schedule, return_proposal=False)
             return (k, s), (s.position, s.log_prob)
         
         (key, state), (samples, lps) = lax.scan(body, (key, state), length=num_samples)
@@ -472,7 +484,11 @@ def rahmc_proposal_trace(
       resample_idx : index where momentum was resampled (or None)
     """
     if friction_schedule is None:
-        friction_schedule = constant_schedule_default
+        friction_schedule = constant_schedule
+        gamma_max = 1.0
+        steepness = 1.0
+
+    steepness_val = steepness if steepness is not None else 5.0
 
     q = jnp.atleast_1d(q0).astype(jnp.float32)
     d = q.shape[-1]
@@ -499,7 +515,7 @@ def rahmc_proposal_trace(
     # ---- Repelling segment ----
     for i in range(L1):
         t_now = i * step_size
-        gamma_t = float(friction_schedule(t_now, total_time))
+        gamma_t = float(friction_schedule(t_now, total_time, gamma_max, steepness_val))
         q, p, lp, glp = _conformal_leapfrog_step(
             q[None, :], p[None, :], step_size, gamma_t,
             lp[None, ...], glp[None, :],  # batched to match your API
@@ -527,7 +543,7 @@ def rahmc_proposal_trace(
     # ---- Attracting segment ----
     for j in range(L2):
         t_now = (L1 + j) * step_size
-        gamma_t = float(friction_schedule(t_now, total_time))
+        gamma_t = float(friction_schedule(t_now, total_time, gamma_max, steepness_val))
         q, p, lp, glp = _conformal_leapfrog_step(
             q[None, :], p[None, :], step_size, gamma_t,
             lp[None, ...], glp[None, :],
