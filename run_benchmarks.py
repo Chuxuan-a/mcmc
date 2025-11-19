@@ -307,7 +307,7 @@ def main():
         "--targets",
         nargs="+",
         default=["standard_normal", "correlated_gaussian", "ill_conditioned_gaussian", "neals_funnel", "log_gamma", "gaussian_mixture"],
-        choices=["standard_normal", "correlated_gaussian", "ill_conditioned_gaussian", "neals_funnel", "log_gamma", "gaussian_mixture"],
+        choices=["standard_normal", "correlated_gaussian", "ill_conditioned_gaussian", "student_t", "log_gamma", "rosenbrock", "neals_funnel", "gaussian_mixture"],
         help="Target distributions (default: all)"
     )
 
