@@ -974,67 +974,67 @@ def main():
         print(f"Total gradient calls = {best['total_gradient_calls']}")
 
     # Generate plots if requested
-    if args.plot:
-        import os
-        os.makedirs(args.output_dir, exist_ok=True)
+    # if args.plot:
+    #     import os
+    #     os.makedirs(args.output_dir, exist_ok=True)
 
-        print(f"\n{'='*60}")
-        print(f"GENERATING DIAGNOSTIC PLOTS")
-        print(f"{'='*60}")
+    #     print(f"\n{'='*60}")
+    #     print(f"GENERATING DIAGNOSTIC PLOTS")
+    #     print(f"{'='*60}")
 
-        if args.sampler == "hmc":
-            # HMC: Plot grid comparison
-            grid_plot_file = os.path.join(args.output_dir, "hmc_grid_comparison.png")
-            plot_grid_comparison(results["grid_results"], results["num_steps_grid"],
-                               output_file=grid_plot_file)
+    #     if args.sampler == "hmc":
+    #         # HMC: Plot grid comparison
+    #         grid_plot_file = os.path.join(args.output_dir, "hmc_grid_comparison.png")
+    #         plot_grid_comparison(results["grid_results"], results["num_steps_grid"],
+    #                            output_file=grid_plot_file)
 
-            # Plot tuning history for best configuration
-            best = results['best_config']
-            tuning_plot_file = os.path.join(args.output_dir, f"hmc_best_L{best['num_steps']}_tuning_history.png")
-            # plot_tuning_history(best["tune_history"], sampler_name=f"HMC (L={best['num_steps']})",
-            #                   output_file=tuning_plot_file)
+    #         # Plot tuning history for best configuration
+    #         best = results['best_config']
+    #         tuning_plot_file = os.path.join(args.output_dir, f"hmc_best_L{best['num_steps']}_tuning_history.png")
+    #         # plot_tuning_history(best["tune_history"], sampler_name=f"HMC (L={best['num_steps']})",
+    #         #                   output_file=tuning_plot_file)
 
-            # Plot sampling diagnostics for best configuration
-            sampling_plot_file = os.path.join(args.output_dir, f"hmc_best_L{best['num_steps']}_sampling_diagnostics.png")
-            plot_sampling_diagnostics(best["samples"], best["diagnostics"],
-                                     sampler_name=f"HMC (L={best['num_steps']})",
-                                     output_file=sampling_plot_file)
-        elif args.sampler == "grahmc":
-            # GRAHMC: Plot grid comparison with schedule-specific parameters
-            schedule_name = args.schedule
-            grid_plot_file = os.path.join(args.output_dir, f"grahmc_{schedule_name}_grid_comparison.png")
-            plot_grahmc_grid_comparison(results["grid_results"], results["num_steps_grid"],
-                                       schedule_type=schedule_name,
-                                       has_steepness=results['has_steepness'],
-                                       output_file=grid_plot_file)
+    #         # Plot sampling diagnostics for best configuration
+    #         sampling_plot_file = os.path.join(args.output_dir, f"hmc_best_L{best['num_steps']}_sampling_diagnostics.png")
+    #         plot_sampling_diagnostics(best["samples"], best["diagnostics"],
+    #                                  sampler_name=f"HMC (L={best['num_steps']})",
+    #                                  output_file=sampling_plot_file)
+    #     elif args.sampler == "grahmc":
+    #         # GRAHMC: Plot grid comparison with schedule-specific parameters
+    #         schedule_name = args.schedule
+    #         grid_plot_file = os.path.join(args.output_dir, f"grahmc_{schedule_name}_grid_comparison.png")
+    #         plot_grahmc_grid_comparison(results["grid_results"], results["num_steps_grid"],
+    #                                    schedule_type=schedule_name,
+    #                                    has_steepness=results['has_steepness'],
+    #                                    output_file=grid_plot_file)
 
-            # Plot coordinate-wise tuning history for best configuration
-            best = results['best_config']
-            tuning_plot_file = os.path.join(args.output_dir,
-                                           f"grahmc_{schedule_name}_best_L{best['num_steps']}_tuning_history.png")
-            plot_coordinate_tuning_history(best["tune_history"], output_file=tuning_plot_file)
+    #         # Plot coordinate-wise tuning history for best configuration
+    #         best = results['best_config']
+    #         tuning_plot_file = os.path.join(args.output_dir,
+    #                                        f"grahmc_{schedule_name}_best_L{best['num_steps']}_tuning_history.png")
+    #         plot_coordinate_tuning_history(best["tune_history"], output_file=tuning_plot_file)
 
-            # Plot sampling diagnostics for best configuration
-            sampling_plot_file = os.path.join(args.output_dir,
-                                             f"grahmc_{schedule_name}_best_L{best['num_steps']}_sampling_diagnostics.png")
-            plot_sampling_diagnostics(best["samples"], best["diagnostics"],
-                                     sampler_name=f"GRAHMC-{schedule_name.upper()} (L={best['num_steps']})",
-                                     output_file=sampling_plot_file)
-        else:
-            # RWMH/NUTS: Standard plots
-            if "history" in results:
-                tuning_plot_file = os.path.join(args.output_dir, f"{args.sampler}_tuning_history.png")
-                plot_tuning_history(results["history"], sampler_name=args.sampler.upper(),
-                                   output_file=tuning_plot_file)
+    #         # Plot sampling diagnostics for best configuration
+    #         sampling_plot_file = os.path.join(args.output_dir,
+    #                                          f"grahmc_{schedule_name}_best_L{best['num_steps']}_sampling_diagnostics.png")
+    #         plot_sampling_diagnostics(best["samples"], best["diagnostics"],
+    #                                  sampler_name=f"GRAHMC-{schedule_name.upper()} (L={best['num_steps']})",
+    #                                  output_file=sampling_plot_file)
+    #     else:
+    #         # RWMH/NUTS: Standard plots
+    #         if "history" in results:
+    #             tuning_plot_file = os.path.join(args.output_dir, f"{args.sampler}_tuning_history.png")
+    #             plot_tuning_history(results["history"], sampler_name=args.sampler.upper(),
+    #                                output_file=tuning_plot_file)
 
-            sampling_plot_file = os.path.join(args.output_dir, f"{args.sampler}_sampling_diagnostics.png")
-            plot_sampling_diagnostics(results["samples"], results["diagnostics"],
-                                     sampler_name=args.sampler.upper(),
-                                     output_file=sampling_plot_file)
+    #         sampling_plot_file = os.path.join(args.output_dir, f"{args.sampler}_sampling_diagnostics.png")
+    #         plot_sampling_diagnostics(results["samples"], results["diagnostics"],
+    #                                  sampler_name=args.sampler.upper(),
+    #                                  output_file=sampling_plot_file)
 
-        print(f"\nPlots saved to {args.output_dir}/")
+    #     print(f"\nPlots saved to {args.output_dir}/")
 
-    return 0
+    # return 0
 
 
 if __name__ == "__main__":

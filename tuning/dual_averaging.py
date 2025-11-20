@@ -372,6 +372,7 @@ def dual_averaging_tune_nuts(
 def coordinate_wise_tune_grahmc(
     key: jnp.ndarray,
     log_prob_fn,
+    grad_log_prob_fn,
     init_position: jnp.ndarray,
     num_steps: int,
     schedule_type: str = 'constant',
@@ -381,6 +382,7 @@ def coordinate_wise_tune_grahmc(
     min_cycles: int = 3,
     patience: int = 2,
     max_iter_per_param: int = 400,
+    inv_mass_matrix: jnp.ndarray = None,
 ) -> Tuple[float, float, float, Dict]:
     """Tune GRAHMC hyperparameters using coordinate-wise dual averaging.
 
@@ -391,6 +393,7 @@ def coordinate_wise_tune_grahmc(
     Args:
         key: JAX random key
         log_prob_fn: Target log probability function
+        grad_log_prob_fn: Gradient of log probability function
         init_position: Initial positions (n_chains, n_dim)
         num_steps: Fixed number of leapfrog steps
         schedule_type: Friction schedule type ('constant', 'tanh', 'sigmoid', 'linear', 'sine')
@@ -400,13 +403,14 @@ def coordinate_wise_tune_grahmc(
         min_cycles: Minimum cycles before checking convergence
         patience: Number of converged cycles required
         max_iter_per_param: Maximum dual averaging iterations per parameter
+        inv_mass_matrix: Optional inverse mass matrix (diagonal)
 
     Returns:
         Tuple of (step_size, gamma, steepness, history) where history contains:
         - cycle_history: List of (step_size, gamma, steepness, accept_rate) per cycle
         - converged_cycle: Cycle where convergence occurred
     """
-    # Get friction schedule and determine if it uses steepness
+    # Get friction schedule function and determine if it uses steepness
     friction_schedule = get_friction_schedule(schedule_type)
     has_steepness = schedule_type in ['tanh', 'sigmoid']
 
@@ -449,7 +453,8 @@ def coordinate_wise_tune_grahmc(
                 step_size=float(jnp.exp(log_step_size)), num_steps=num_steps,
                 gamma=float(gamma), steepness=float(steepness),
                 num_samples=n_samples_per_tune, burn_in=0,
-                friction_schedule=friction_schedule
+                friction_schedule=friction_schedule,
+                inv_mass_matrix=inv_mass_matrix
             )
             alpha = float(jnp.mean(accept_rate))
 
@@ -474,7 +479,8 @@ def coordinate_wise_tune_grahmc(
                 step_size=float(step_size), num_steps=num_steps,
                 gamma=float(jnp.exp(log_gamma)), steepness=float(steepness),
                 num_samples=n_samples_per_tune, burn_in=0,
-                friction_schedule=friction_schedule
+                friction_schedule=friction_schedule,
+                inv_mass_matrix=inv_mass_matrix
             )
             alpha = float(jnp.mean(accept_rate))
 
@@ -500,7 +506,8 @@ def coordinate_wise_tune_grahmc(
                     step_size=float(step_size), num_steps=num_steps,
                     gamma=float(gamma), steepness=float(jnp.exp(log_steepness)),
                     num_samples=n_samples_per_tune, burn_in=0,
-                    friction_schedule=friction_schedule
+                    friction_schedule=friction_schedule,
+                    inv_mass_matrix=inv_mass_matrix
                 )
                 alpha = float(jnp.mean(accept_rate))
 
@@ -519,7 +526,8 @@ def coordinate_wise_tune_grahmc(
             step_size=float(step_size), num_steps=num_steps,
             gamma=float(gamma), steepness=float(steepness),
             num_samples=n_samples_per_tune, burn_in=0,
-            friction_schedule=friction_schedule
+            friction_schedule=friction_schedule,
+            inv_mass_matrix=inv_mass_matrix
         )
         final_accept = float(jnp.mean(accept_rate))
 

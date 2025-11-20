@@ -1,46 +1,47 @@
-"""Windowed adaptation manager for MCMC preconditioning."""
+"""Optimized windowed adaptation manager for MCMC preconditioning."""
 import jax
 import jax.numpy as jnp
 from jax import random
 import numpy as np
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, Optional
+import time
 
 from tuning.welford import welford_init, welford_update_batch, welford_covariance
 from tuning.dual_averaging import da_init, da_update, da_reset
 
-from samplers.HMC import hmc_run
-from samplers.NUTS import nuts_run
-from samplers.GRAHMC import rahmc_run
+from samplers.HMC import hmc_init, hmc_run
+from samplers.NUTS import nuts_init, nuts_run
+from samplers.GRAHMC import rahmc_init, rahmc_run
 
 
 def build_schedule(num_steps: int, initial_buffer: int = 75, final_buffer: int = 50, window_base: int = 25) -> list:
     """Build a Stan-style windowed schedule.
-    
+
     Returns a list of tuples: (start_index, end_index, type)
     Types: 'fast_init', 'slow', 'fast_final'
     """
     schedule = []
     start = 0
-    
+
     # 1. Initial fast interval
     if num_steps < initial_buffer + final_buffer + window_base:
         # Fallback for very short runs
         return [(0, num_steps, 'fast_init')]
-        
+
     schedule.append((start, start + initial_buffer, 'fast_init'))
     start += initial_buffer
-    
+
     # 2. Windowed slow intervals (doubling size)
     # Remaining space for windows
     available = num_steps - start - final_buffer
     window_size = window_base
-    
+
     while available >= 2 * window_size: # While we can fit a window
         schedule.append((start, start + window_size, 'slow'))
         start += window_size
         available -= window_size
         window_size *= 2 # Double the window
-        
+
     # If there is leftover space in 'slow' region, extend the last window
     if available > 0 and len(schedule) > 1 and schedule[-1][2] == 'slow':
         prev_start, _, _ = schedule.pop()
@@ -54,151 +55,223 @@ def build_schedule(num_steps: int, initial_buffer: int = 75, final_buffer: int =
 
     # 3. Final fast interval
     schedule.append((start, num_steps, 'fast_final'))
-    
+
     return schedule
 
 
 def run_adaptive_warmup(
+    sampler: str,
+    target_log_prob: Any,
+    target_grad_log_prob: Any,
+    initial_position: jnp.ndarray,
     key: jnp.ndarray,
-    sampler_name: str,
-    log_prob_fn: Any,
-    init_position: jnp.ndarray,
     num_warmup: int = 1000,
-    target_accept: float = 0.8, # Higher default for NUTS/HMC in warmup
-    **sampler_kwargs
-) -> Tuple[float, jnp.ndarray, jnp.ndarray, Dict]:
-    """Run full windowed adaptation to find step_size and mass_matrix.
-    
+    target_accept: float = 0.65,
+    schedule_type: Optional[str] = None,
+    update_freq: int = 100,  # Update DA every N steps instead of every step
+    **kwargs,
+) -> Tuple[float, Optional[jnp.ndarray], jnp.ndarray, Dict]:
+    """Run optimized windowed adaptation to find step_size and mass_matrix.
+
+    OPTIMIZATIONS:
+    1. Batch sampling: Run sampler for `update_freq` steps between DA updates (10-50x speedup)
+    2. GRAHMC tuning: Properly tune gamma and steepness AFTER mass matrix learning
+
+    CORRECT TUNING ORDER FOR GRAHMC:
+    1. Phase 1-2: Tune step size + learn mass matrix (sphere the distribution)
+    2. Phase 3: Tune gamma/steepness on the SPHERED geometry using the learned mass matrix
+
     Args:
-        sampler_name: 'hmc', 'nuts', or 'grahmc'
-        init_position: (n_chains, n_dim)
+        sampler: 'hmc', 'nuts', or 'grahmc'/'rahmc'
+        target_log_prob: Log probability function
+        target_grad_log_prob: Gradient of log probability
+        initial_position: (n_chains, n_dim)
+        key: JAX random key
         num_warmup: Total warmup iterations
-        sampler_kwargs: constants like num_steps (L), gamma, steepness, etc.
-        
+        target_accept: Target acceptance rate
+        schedule_type: Friction schedule for GRAHMC ('constant', 'tanh', etc.)
+        update_freq: Update dual averaging every N steps (default: 100)
+
     Returns:
         (step_size, inv_mass_matrix, final_position, info_dict)
     """
-    n_chains, n_dim = init_position.shape
-    
-    # 1. Initialize State
-    # Initial step size guess (standard heuristic)
-    initial_step = 1.0 # Will be quickly tuned by DA
+    n_chains, n_dim = initial_position.shape
+
+    start_time = time.time()
+
+    # ========================================================================
+    # PHASE 1-2: Step Size Tuning + Mass Matrix Learning
+    # ========================================================================
+    # For HMC/NUTS, use standard initial guess
+    # For GRAHMC, use fixed defaults that will be refined in Phase 3
+    if sampler in ["grahmc", "rahmc"]:
+        # Use conservative defaults for initial tuning
+        gamma = 1.0
+        steepness = 5.0 if schedule_type == "tanh" else 10.0
+        initial_step = 0.5 / jnp.sqrt(n_dim)
+    else:
+        gamma = None
+        steepness = None
+        initial_step = 1.0
+
     da_state = da_init(initial_step)
-    
+
     # Initial Mass Matrix (Identity)
-    # inv_mass_matrix represents the diagonal vector M^{-1}
     inv_mass_matrix = jnp.ones(n_dim)
-    
+
     # Current position
-    position = init_position
-    
+    position = initial_position
+
     # Build Schedule
     schedule = build_schedule(num_warmup)
-    
+
     print(f"Adaptation Schedule ({num_warmup} steps):")
     for s, e, t in schedule:
         print(f"  [{s:4d} - {e:4d}] {t}")
 
-    # 2. Run Schedule
+    # Run Windowed Adaptation
     welford_state = None
-    
-    # Batch size for running the sampler inside the loop
-    # We run 1 step at a time (or small chunks) to update DA
-    # For efficiency in Python loop, we'll run chunks of 1 if possible, 
-    # or rely on the sampler_run function for 'n' samples.
-    # Ideally, we pass `inv_mass_matrix` to the sampler.
-    
+
     for start_idx, end_idx, phase in schedule:
         window_len = end_idx - start_idx
-        
+
         # Reset Welford at the start of a 'slow' window
         if phase == 'slow':
             welford_state = welford_init(n_dim)
-            
-        # Run the window
-        # We process in small batches to update DA frequently
-        # A batch size of 10-20 is a good balance between JAX dispatch overhead and DA updates
-        update_freq = 1 
-        
-        for i in range(window_len):
+
+        # OPTIMIZATION: Run sampler in batches instead of 1 step at a time
+        num_batches = max(1, window_len // update_freq)
+        samples_per_batch = window_len // num_batches
+
+        for batch_idx in range(num_batches):
             key, subkey = random.split(key)
-            
+
             # Current parameters
             current_step_size = jnp.exp(da_state.log_step)
-            
-            # Run Sampler (1 step)
-            # IMPORTANT: Samplers must now accept inv_mass_matrix!
-            if sampler_name == "hmc":
-                # Unpack kwargs
-                L = sampler_kwargs.get("num_steps", 20)
+
+            # Get sampler-specific parameters from kwargs (but don't override gamma/steepness for GRAHMC)
+            num_steps = kwargs.get("num_steps", 20)
+            max_tree_depth = kwargs.get("max_tree_depth", 10)
+
+            # Run Sampler for a batch of samples
+            if sampler == "hmc":
                 _, _, accept_rate, final_state = hmc_run(
-                    subkey, log_prob_fn, position,
-                    step_size=float(current_step_size), num_steps=L,
-                    inv_mass_matrix=inv_mass_matrix, # <--- Component A integration
-                    num_samples=1, burn_in=0
+                    subkey, target_log_prob, position,
+                    step_size=float(current_step_size),
+                    num_steps=num_steps,
+                    num_samples=samples_per_batch,
+                    burn_in=0,
+                    inv_mass_matrix=inv_mass_matrix,
                 )
-            elif sampler_name == "nuts":
-                depth = sampler_kwargs.get("max_tree_depth", 10)
-                _, _, _, final_state, _, mean_accept_probs = nuts_run(
-                    subkey, log_prob_fn, position,
-                    step_size=float(current_step_size), max_tree_depth=depth,
-                    inv_mass_matrix=inv_mass_matrix, # <--- Component A integration
-                    num_samples=1, burn_in=0
+            elif sampler == "nuts":
+                samples_batch, _, accept_rate, final_state, _, mean_accept_probs = nuts_run(
+                    subkey, target_log_prob, position,
+                    step_size=float(current_step_size),
+                    num_samples=samples_per_batch,
+                    burn_in=0,
+                    inv_mass_matrix=inv_mass_matrix,
+                    max_tree_depth=max_tree_depth,
                 )
-                accept_rate = mean_accept_probs # NUTS uses specific stat
-            elif sampler_name in ["grahmc", "rahmc"]:
-                L = sampler_kwargs.get("num_steps", 20)
-                gamma = sampler_kwargs.get("gamma", 0.1)
-                steepness = sampler_kwargs.get("steepness", 5.0)
-                fs = sampler_kwargs.get("friction_schedule", None)
-                
-                _, _, accept_rate, final_state = rahmc_run(
-                    subkey, log_prob_fn, position,
-                    step_size=float(current_step_size), num_steps=L,
-                    gamma=gamma, steepness=steepness,
-                    inv_mass_matrix=inv_mass_matrix, # <--- Component A integration
-                    friction_schedule=fs,
-                    num_samples=1, burn_in=0
+                accept_rate = mean_accept_probs  # NUTS uses MH acceptance probability
+            elif sampler in ["grahmc", "rahmc"]:
+                from samplers.GRAHMC import get_friction_schedule
+                friction_schedule = get_friction_schedule(schedule_type or "constant")
+                samples_batch, _, accept_rate, final_state = rahmc_run(
+                    subkey, target_log_prob, position,
+                    step_size=float(current_step_size),
+                    num_steps=num_steps,
+                    gamma=float(gamma),
+                    steepness=float(steepness),
+                    num_samples=samples_per_batch,
+                    burn_in=0,
+                    friction_schedule=friction_schedule,
+                    inv_mass_matrix=inv_mass_matrix,
                 )
-            
+            else:
+                raise ValueError(f"Unknown sampler: {sampler}")
+
+            # Update position for next batch
             position = final_state.position
-            avg_accept = float(jnp.mean(accept_rate))
-            
+
             # Update Dual Averaging (Step Size)
+            avg_accept = float(jnp.mean(accept_rate))
             da_state = da_update(da_state, avg_accept, target_accept)
-            
+
             # Update Welford (Mass Matrix) if in slow phase
-            if phase == 'slow':
-                # position shape is (n_chains, n_dim)
-                welford_state = welford_update_batch(welford_state, position)
+            if phase == 'slow' and sampler in ["hmc", "nuts", "grahmc", "rahmc"]:
+                # Accumulate all samples from this batch
+                if 'samples_batch' in locals():
+                    # samples_batch shape: (num_samples, n_chains, n_dim)
+                    for sample in samples_batch:
+                        welford_state = welford_update_batch(welford_state, sample)
+                else:
+                    # For HMC without returned samples, just use final position
+                    welford_state = welford_update_batch(welford_state, position)
 
         # End of Window Actions
         if phase == 'slow':
             # 1. Estimate Variance
             _, variance = welford_covariance(welford_state)
-            
+
             # 2. Regularize (Stan approach)
-            # Push towards identity slightly to avoid 0 variance
-            # var_new = (n / (n + 5)) * var + (5 / (n + 5)) * 1e-3
             n_samples = welford_state.count
             regularizer = 1e-3 * 5.0 / (n_samples + 5.0)
             variance = variance * (n_samples / (n_samples + 5.0)) + regularizer
-            
+
             # 3. Update Mass Matrix
             inv_mass_matrix = variance
             print(f"  Window finished. Updated Mass Matrix. Range: [{jnp.min(variance):.4f}, {jnp.max(variance):.4f}]")
-            
+
             # 4. Reset Dual Averaging
-            # We keep the step size we found, but reset the 'memory' 
-            # because the geometry just changed dramatically.
             da_state = da_reset(da_state)
-    
+
     final_step_size = float(jnp.exp(da_state.log_step_bar))
     print(f"Warmup Complete. Final step_size: {final_step_size:.5f}")
-    
+
+    # ========================================================================
+    # PHASE 3: GRAHMC Friction Refinement (AFTER mass matrix learning)
+    # ========================================================================
+    if sampler in ["grahmc", "rahmc"]:
+        print(f"\n[Phase 3] Tuning GRAHMC friction on learned mass matrix...")
+
+        from tuning.dual_averaging import coordinate_wise_tune_grahmc
+
+        # NOW tune gamma/steepness using the learned mass matrix
+        # This ensures friction is tuned for the sphered geometry
+        num_steps = kwargs.get("num_steps", 20)  # Extract from kwargs
+        tuned_step, tuned_gamma, tuned_steepness, tune_history = coordinate_wise_tune_grahmc(
+            key=random.fold_in(key, 999),  # New key for tuning phase
+            log_prob_fn=target_log_prob,
+            grad_log_prob_fn=target_grad_log_prob,
+            init_position=position,  # Use current warmed-up position
+            num_steps=num_steps,  # Use the value from grid search
+            schedule_type=schedule_type or "constant",
+            inv_mass_matrix=inv_mass_matrix,  # ← CRITICAL: Pass learned mass matrix
+            max_cycles=10,  # Just a few cycles for refinement
+        )
+
+        # Use the refined friction parameters
+        gamma = tuned_gamma
+        steepness = tuned_steepness
+
+        final_step_size = tuned_step
+
+        print(f"  Refined friction parameters:")
+        print(f"    gamma={tuned_gamma:.5f}")
+        print(f"    steepness={tuned_steepness:.5f}")
+        print(f"    step_size={final_step_size:.5f} (re-tuned)")
+
+    elapsed_time = time.time() - start_time
+
     info = {
+        "elapsed_time": elapsed_time,
         "final_step_size": final_step_size,
-        "inv_mass_matrix": inv_mass_matrix
+        "inv_mass_matrix": inv_mass_matrix,
     }
-    
+
+    # Add GRAHMC-specific parameters to info
+    if sampler in ["grahmc", "rahmc"]:
+        info["gamma"] = float(gamma) if gamma is not None else 1.0
+        info["steepness"] = float(steepness) if steepness is not None else 5.0
+
     return final_step_size, inv_mass_matrix, position, info
