@@ -443,13 +443,13 @@ def tune_and_sample_hmc_grid(
         batch_size: Number of samples per batch
         max_samples: Maximum total samples to collect
         warmup_steps: Number of warmup steps for adaptation.
-        num_steps_grid: List of num_steps values to try (default: [8, 16, 32, 64])
+        num_steps_grid: List of num_steps values to try (default: [8, 16, 24, 32, 48, 64])
 
     Returns:
         Dictionary containing best configuration, grid results, and comparison data
     """
     if num_steps_grid is None:
-        num_steps_grid = [8, 16, 32, 64]
+        num_steps_grid = [8, 16, 24, 32, 48, 64]
 
     n_dim = target.dim
     log_prob_fn = target.log_prob_fn
@@ -607,13 +607,13 @@ def tune_and_sample_grahmc_grid(
         warmup_steps: Number of warmup steps for adaptation.
         max_cycles: Maximum coordinate-wise tuning cycles
         schedule_type: Friction schedule ('constant', 'tanh', 'sigmoid', 'linear', 'sine')
-        num_steps_grid: List of num_steps values to try (default: [8, 16, 32, 64])
+        num_steps_grid: List of num_steps values to try (default: [8, 16, 24, 32, 48, 64])
 
     Returns:
         Dictionary containing best configuration, grid results, and comparison data
     """
     if num_steps_grid is None:
-        num_steps_grid = [8, 16, 32, 64]
+        num_steps_grid = [8, 16, 24, 32, 48, 64]
 
     n_dim = target.dim
     log_prob_fn = target.log_prob_fn
@@ -895,7 +895,7 @@ def main():
     elif args.sampler == "hmc":
         # Parse num_steps grid (default for HMC)
         if args.num_steps_grid is None:
-            num_steps_grid = [8, 16, 32, 64]
+            num_steps_grid = [8, 16, 24, 32, 48, 64]
         else:
             num_steps_grid = [int(x) for x in args.num_steps_grid.split(',')]
         results = tune_and_sample_hmc_grid(
@@ -920,9 +920,9 @@ def main():
             max_tree_depth=args.max_tree_depth,
         )
     elif args.sampler == "grahmc":
-        # Parse num_steps grid (default for GRAHMC - smaller than HMC)
+        # Parse num_steps grid (default for GRAHMC)
         if args.num_steps_grid is None:
-            num_steps_grid = [8, 16, 32, 64]
+            num_steps_grid = [8, 16, 24, 32, 48, 64]
         else:
             num_steps_grid = [int(x) for x in args.num_steps_grid.split(',')]
         results = tune_and_sample_grahmc_grid(

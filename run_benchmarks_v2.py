@@ -156,8 +156,17 @@ def run_trajectory_length_grid_search(
 
         grid_results.append(result)
 
-    # Select best result based on ESS per gradient
-    best_result = max(grid_results, key=lambda r: r["ess_per_gradient"])
+    # Select best result based on ESS per gradient (among passing runs only)
+    passing_results = [r for r in grid_results if r.get("overall_pass", False)]
+
+    if passing_results:
+        # Choose best among passing runs
+        best_result = max(passing_results, key=lambda r: r["ess_per_gradient"])
+    else:
+        # No passing runs - choose best ESS/grad anyway (mark as failed)
+        best_result = max(grid_results, key=lambda r: r["ess_per_gradient"])
+        print("\n!!! WARNING: NO L VALUES PASSED ALL CHECKS !!!")
+        print("!!! Selecting best ESS/grad among failed runs !!!")
 
     print(f"\n{'='*80}")
     print(f"GRID SEARCH COMPLETE")
@@ -469,7 +478,7 @@ def run_all_benchmarks(
 
     Args:
         num_steps_grid: Grid of trajectory lengths to test for HMC/GRAHMC.
-                       If None, uses default [8, 16, 32, 64].
+                       If None, uses default [8, 16, 24, 32, 48, 64].
     """
 
     # Set up JAX
@@ -481,7 +490,7 @@ def run_all_benchmarks(
 
     # Default grid for trajectory length if not specified
     if num_steps_grid is None:
-        num_steps_grid = [8, 16, 32, 64]
+        num_steps_grid = [8, 16, 24, 32, 48, 64]
 
     all_results = []
 
@@ -645,7 +654,7 @@ def main():
     parser.add_argument("--max-samples", type=int, default=50000,
                        help="Maximum samples before giving up")
     parser.add_argument("--num-steps-grid", nargs="+", type=int, default=None,
-                       help="Grid of trajectory lengths to test for HMC/GRAHMC (default: [8, 16, 32, 64])")
+                       help="Grid of trajectory lengths to test for HMC/GRAHMC (default: [8, 16, 24, 32, 48, 64])")
 
     # Output
     parser.add_argument("--output-dir", type=str, default="benchmark_results",
