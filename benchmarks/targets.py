@@ -539,3 +539,113 @@ def list_targets():
         print(f"  True mean: {'Available' if target.true_mean is not None else 'Not tractable'}")
         print(f"  True cov: {'Available' if target.true_cov is not None else 'Not tractable'}")
         print(f"  Custom init: {'Yes' if target.init_sampler is not None else 'No'}")
+
+
+# ============================================================================
+# Reference Samplers for Ground Truth
+# ============================================================================
+
+def get_reference_sampler(target_name: str, dim: int = 10, **kwargs):
+    """
+    Get a function that generates ground truth samples from the target distribution.
+
+    This is used for computing distributional distances (e.g., Sliced Wasserstein)
+    between MCMC samples and the true distribution.
+
+    Args:
+        target_name: Name of the target distribution
+        dim: Dimensionality
+        **kwargs: Additional parameters for the target
+
+    Returns:
+        A function (key, n_samples) -> samples of shape (n_samples, dim),
+        or None if no direct sampler is available (e.g., Rosenbrock).
+    """
+    if target_name == 'standard_normal':
+        def sampler(key, n):
+            return random.normal(key, (n, dim))
+        return sampler
+
+    elif target_name == 'correlated_gaussian':
+        correlation = kwargs.get('correlation', 0.9)
+        # Build covariance and Cholesky factor
+        cov = (1.0 - correlation) * jnp.eye(dim) + correlation * jnp.ones((dim, dim))
+        L = jnp.linalg.cholesky(cov)
+        def sampler(key, n):
+            z = random.normal(key, (n, dim))
+            return z @ L.T
+        return sampler
+
+    elif target_name == 'ill_conditioned_gaussian':
+        condition_number = kwargs.get('condition_number', 100.0)
+        eigenvalues = jnp.linspace(1.0, condition_number, dim)
+        scales = jnp.sqrt(eigenvalues)
+        def sampler(key, n):
+            z = random.normal(key, (n, dim))
+            return z * scales
+        return sampler
+
+    elif target_name == 'student_t':
+        df = kwargs.get('df', 3.0)
+        def sampler(key, n):
+            # Student-t can be sampled as Normal / sqrt(Chi2/df)
+            k1, k2 = random.split(key)
+            z = random.normal(k1, (n, dim))
+            # Chi2(df) = Gamma(df/2, 0.5)
+            chi2 = random.gamma(k2, df / 2.0, (n, 1)) * 2.0
+            return z / jnp.sqrt(chi2 / df)
+        return sampler
+
+    elif target_name == 'log_gamma':
+        shape = kwargs.get('shape', 2.0)
+        rate = kwargs.get('rate', 1.0)
+        def sampler(key, n):
+            # Sample Gamma, return as-is (not log-transformed, since target is Gamma not log-Gamma)
+            return random.gamma(key, shape, (n, dim)) / rate
+        return sampler
+
+    elif target_name == 'neals_funnel':
+        def sampler(key, n):
+            k1, k2 = random.split(key)
+            # v ~ N(0, 9), i.e., N(0, 3^2)
+            v = random.normal(k1, (n,)) * 3.0
+            # x_i | v ~ N(0, exp(v))
+            x_rest = random.normal(k2, (n, dim - 1)) * jnp.exp(v / 2.0)[:, None]
+            return jnp.concatenate([v[:, None], x_rest], axis=1)
+        return sampler
+
+    elif target_name == 'gaussian_mixture':
+        n_modes = kwargs.get('n_modes', 2)
+        separation = kwargs.get('separation', 5.0)
+        if n_modes != 2:
+            return None
+        def sampler(key, n):
+            k1, k2, k3 = random.split(key, 3)
+            # Sample component assignments (0 or 1)
+            components = random.bernoulli(k1, 0.5, (n,))
+            # x0: mode at -sep/2 or +sep/2
+            x0 = random.normal(k2, (n,)) + jnp.where(components, separation / 2.0, -separation / 2.0)
+            # Remaining dimensions are standard normal
+            x_rest = random.normal(k3, (n, dim - 1))
+            return jnp.concatenate([x0[:, None], x_rest], axis=1)
+        return sampler
+
+    elif target_name == 'rosenbrock':
+        # No direct sampler available for Rosenbrock
+        return None
+
+    else:
+        return None
+
+
+def has_reference_sampler(target_name: str) -> bool:
+    """Check if a target has a direct reference sampler available."""
+    return target_name in [
+        'standard_normal',
+        'correlated_gaussian',
+        'ill_conditioned_gaussian',
+        'student_t',
+        'log_gamma',
+        'neals_funnel',
+        'gaussian_mixture',
+    ]

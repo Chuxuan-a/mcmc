@@ -7,10 +7,10 @@ framework. Mass matrix learning can be enabled (default) or disabled.
 Usage:
     # With mass matrix learning (default)
     python run_benchmarks.py --dim 20 --targets standard_normal ill_conditioned_gaussian
-    python run_benchmarks.py --dim 10 --all-targets --output-dir results
+    python run_benchmarks.py --dim 20 --all-targets --output-dir results_with_mass
 
     # Without mass matrix learning (use identity matrix)
-    python run_benchmarks.py --dim 10 --all-targets --no-mass-matrix --output-dir results_no_mass
+    python run_benchmarks.py --dim 20 --all-targets --no-mass-matrix --output-dir results_no_mass --max-samples 100000
 """
 
 import argparse
@@ -28,6 +28,7 @@ from jax import random, grad
 import arviz as az
 
 from benchmarks.targets import get_target, TargetDistribution
+from benchmarks.metrics import compute_sliced_w2
 from tuning.adaptation import run_adaptive_warmup
 from samplers.HMC import hmc_run
 from samplers.NUTS import nuts_run
@@ -107,6 +108,7 @@ def check_summary_statistics(diagnostics: Dict, target: TargetDistribution, z_th
 def run_trajectory_length_grid_search(
     sampler: str,
     target: TargetDistribution,
+    target_name: str,
     key: jnp.ndarray,
     n_chains: int,
     num_warmup: int,
@@ -139,6 +141,7 @@ def run_trajectory_length_grid_search(
         result = run_single_benchmark_with_L(
             sampler=sampler,
             target=target,
+            target_name=target_name,
             key=subkey,
             n_chains=n_chains,
             num_warmup=num_warmup,
@@ -203,6 +206,7 @@ def run_trajectory_length_grid_search(
 def run_single_benchmark_with_L(
     sampler: str,
     target: TargetDistribution,
+    target_name: str,
     key: jnp.ndarray,
     n_chains: int,
     num_warmup: int,
@@ -400,6 +404,18 @@ def run_single_benchmark_with_L(
         diagnostics = compute_diagnostics(samples)
         stats_pass = check_summary_statistics(diagnostics, target, z_threshold=5.0)
 
+        # Compute Sliced W2 distance to ground truth
+        print("[Phase 4] Computing Sliced W2 distance...")
+        key, w2_key = random.split(key)
+        sliced_w2 = compute_sliced_w2(
+            samples, target_name, target.dim,
+            n_reference=50000, n_projections=500, key=w2_key
+        )
+        if sliced_w2 is not None:
+            print(f"  Sliced W2: {sliced_w2:.6f}")
+        else:
+            print(f"  Sliced W2: N/A (no reference sampler)")
+
         total_time = time.time() - start_time
 
         # Compile results
@@ -436,6 +452,8 @@ def run_single_benchmark_with_L(
                 diagnostics["ess_tail_min"] >= target_ess * 0.5 and
                 stats_pass
             ),
+            # Distributional distance
+            "sliced_w2": sliced_w2,
         }
 
         # Add sampler-specific metadata
@@ -523,6 +541,7 @@ def run_all_benchmarks(
                     results = run_trajectory_length_grid_search(
                         sampler=sampler,
                         target=target,
+                        target_name=target_name,
                         key=subkey,
                         n_chains=n_chains,
                         num_warmup=num_warmup,
@@ -540,6 +559,7 @@ def run_all_benchmarks(
                 results = run_trajectory_length_grid_search(
                     sampler=sampler,
                     target=target,
+                    target_name=target_name,
                     key=subkey,
                     n_chains=n_chains,
                     num_warmup=num_warmup,
@@ -557,6 +577,7 @@ def run_all_benchmarks(
                 results = run_single_benchmark_with_L(
                     sampler=sampler,
                     target=target,
+                    target_name=target_name,
                     key=subkey,
                     n_chains=n_chains,
                     num_warmup=num_warmup,
