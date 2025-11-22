@@ -241,20 +241,42 @@ def run_adaptive_warmup(
     if sampler in ["grahmc", "rahmc"]:
         print(f"\n[Phase 3] Tuning GRAHMC friction on learned mass matrix...")
 
-        from tuning.dual_averaging import coordinate_wise_tune_grahmc
+        # from tuning.dual_averaging import coordinate_wise_tune_grahmc
 
-        # NOW tune gamma/steepness using the learned mass matrix
-        # This ensures friction is tuned for the sphered geometry
-        num_steps = kwargs.get("num_steps", 20)  # Extract from kwargs
-        tuned_step, tuned_gamma, tuned_steepness, tune_history = coordinate_wise_tune_grahmc(
-            key=random.fold_in(key, 999),  # New key for tuning phase
+        # # NOW tune gamma/steepness using the learned mass matrix
+        # # This ensures friction is tuned for the sphered geometry
+        # num_steps = kwargs.get("num_steps", 20)  # Extract from kwargs
+        # tuned_step, tuned_gamma, tuned_steepness, tune_history = coordinate_wise_tune_grahmc(
+        #     key=random.fold_in(key, 999),  # New key for tuning phase
+        #     log_prob_fn=target_log_prob,
+        #     grad_log_prob_fn=target_grad_log_prob,
+        #     init_position=position,  # Use current warmed-up position
+        #     num_steps=num_steps,  # Use the value from grid search
+        #     schedule_type=schedule_type or "constant",
+        #     inv_mass_matrix=inv_mass_matrix,  # ← CRITICAL: Pass learned mass matrix
+        #     max_cycles=10,  # Just a few cycles for refinement
+        # )
+
+        from tuning.dual_averaging import joint_tune_grahmc
+
+        num_steps = kwargs.get("num_steps", 20)
+        
+        # Determine fixed steepness based on schedule
+        fixed_steepness = 5.0 if schedule_type == "tanh" else 10.0
+        
+        # Run Joint Tuning
+        tuned_step, tuned_gamma, tuned_steepness, tune_history = joint_tune_grahmc(
+            key=random.fold_in(key, 999),
             log_prob_fn=target_log_prob,
             grad_log_prob_fn=target_grad_log_prob,
-            init_position=position,  # Use current warmed-up position
-            num_steps=num_steps,  # Use the value from grid search
+            init_position=position,
+            num_steps=num_steps,
             schedule_type=schedule_type or "constant",
-            inv_mass_matrix=inv_mass_matrix,  # ← CRITICAL: Pass learned mass matrix
-            max_cycles=10,  # Just a few cycles for refinement
+            target_accept=target_accept,
+            max_iter=1000, # usually sufficient
+            inv_mass_matrix=inv_mass_matrix,
+            current_step_size=final_step_size, # Pass the Phase 2 step size as a starting point
+            fixed_steepness=fixed_steepness
         )
 
         # Use the refined friction parameters
