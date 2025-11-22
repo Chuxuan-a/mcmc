@@ -105,17 +105,19 @@ def run_adaptive_warmup(
     # ========================================================================
     # PHASE 1-2: Step Size Tuning + Mass Matrix Learning
     # ========================================================================
-    # For HMC/NUTS, use standard initial guess
-    # For GRAHMC, use fixed defaults that will be refined in Phase 3
+    # Use dimension-scaled initial step size for all samplers.
+    # Starting from 1.0 causes issues on harmonic oscillators (like StandardNormal)
+    # due to leapfrog resonances creating non-monotonic acceptance curves.
+    # Starting small and letting DA increase step size works more reliably.
+    initial_step = 0.5 / jnp.sqrt(n_dim)
+
     if sampler in ["grahmc", "rahmc"]:
         # Use conservative defaults for initial tuning
         gamma = 1.0
         steepness = 5.0 if schedule_type == "tanh" else 10.0
-        initial_step = 0.5 / jnp.sqrt(n_dim)
     else:
         gamma = None
         steepness = None
-        initial_step = 1.0
 
     da_state = da_init(initial_step)
 
@@ -226,8 +228,9 @@ def run_adaptive_warmup(
                 inv_mass_matrix = variance
                 print(f"  Window finished. Updated Mass Matrix. Range: [{jnp.min(variance):.4f}, {jnp.max(variance):.4f}]")
 
-            # 4. Reset Dual Averaging (always, even without mass matrix learning)
-            da_state = da_reset(da_state)
+                # 4. Reset Dual Averaging only when mass matrix changes
+                # (geometry changed, so step size needs re-tuning from new baseline)
+                da_state = da_reset(da_state)
 
     final_step_size = float(jnp.exp(da_state.log_step_bar))
     print(f"Warmup Complete. Final step_size: {final_step_size:.5f}")

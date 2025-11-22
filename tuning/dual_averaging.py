@@ -511,35 +511,38 @@ def coordinate_wise_tune_grahmc(
 
         gamma = float(jnp.exp(log_gamma_bar))
 
-        # ===== 3. Tune steepness (hold step_size, gamma fixed) - if applicable =====
-        if has_steepness:
-            log_steepness = jnp.log(steepness)
-            mu_steepness = log_steepness
-            log_steepness_bar = log_steepness  # Initialize to current value, not 0.0
-            H_bar_steepness = 0.0
-
-            for m in range(1, max_iter_per_param + 1):
-                key, subkey = random.split(key)
-                _, _, accept_rate, final_state = rahmc_run(
-                    subkey, log_prob_fn, current_position,
-                    step_size=float(step_size), num_steps=num_steps,
-                    gamma=float(gamma), steepness=float(jnp.exp(log_steepness)),
-                    num_samples=n_samples_per_tune, burn_in=0,
-                    friction_schedule=friction_schedule,
-                    inv_mass_matrix=inv_mass_matrix
-                )
-                current_position = final_state.position  # Evolve chain
-                alpha = float(jnp.mean(accept_rate))
-
-                eta_m = 1.0 / (m + t0)
-                H_bar_steepness = (1 - eta_m) * H_bar_steepness + eta_m * (target_accept - alpha)
-                log_steepness = mu_steepness - (jnp.sqrt(m) / gamma_da) * H_bar_steepness
-                # Clip to prevent explosion: steepness in [0.5, 20.0]
-                log_steepness = jnp.clip(log_steepness, jnp.log(0.5), jnp.log(20.0))
-                m_kappa = m ** (-kappa)
-                log_steepness_bar = m_kappa * log_steepness + (1 - m_kappa) * log_steepness_bar
-
-            steepness = float(jnp.exp(log_steepness_bar))
+        # ===== 3. Steepness: use fixed value, not DA tuning =====
+        # DA tuning for steepness disabled because acceptance rate is not the right
+        # objective - it was driving steepness to extreme values (step-function behavior).
+        # Steepness remains at its initialized value (5.0 for tanh, 10.0 for sigmoid).
+        #
+        # if has_steepness:
+        #     log_steepness = jnp.log(steepness)
+        #     mu_steepness = log_steepness
+        #     log_steepness_bar = log_steepness
+        #     H_bar_steepness = 0.0
+        #
+        #     for m in range(1, max_iter_per_param + 1):
+        #         key, subkey = random.split(key)
+        #         _, _, accept_rate, final_state = rahmc_run(
+        #             subkey, log_prob_fn, current_position,
+        #             step_size=float(step_size), num_steps=num_steps,
+        #             gamma=float(gamma), steepness=float(jnp.exp(log_steepness)),
+        #             num_samples=n_samples_per_tune, burn_in=0,
+        #             friction_schedule=friction_schedule,
+        #             inv_mass_matrix=inv_mass_matrix
+        #         )
+        #         current_position = final_state.position
+        #         alpha = float(jnp.mean(accept_rate))
+        #
+        #         eta_m = 1.0 / (m + t0)
+        #         H_bar_steepness = (1 - eta_m) * H_bar_steepness + eta_m * (target_accept - alpha)
+        #         log_steepness = mu_steepness - (jnp.sqrt(m) / gamma_da) * H_bar_steepness
+        #         log_steepness = jnp.clip(log_steepness, jnp.log(0.5), jnp.log(20.0))
+        #         m_kappa = m ** (-kappa)
+        #         log_steepness_bar = m_kappa * log_steepness + (1 - m_kappa) * log_steepness_bar
+        #
+        #     steepness = float(jnp.exp(log_steepness_bar))
 
         # Get final acceptance rate for this cycle
         key, subkey = random.split(key)
