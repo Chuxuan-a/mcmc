@@ -534,8 +534,8 @@ def coordinate_wise_tune_grahmc(
                 eta_m = 1.0 / (m + t0)
                 H_bar_steepness = (1 - eta_m) * H_bar_steepness + eta_m * (target_accept - alpha)
                 log_steepness = mu_steepness - (jnp.sqrt(m) / gamma_da) * H_bar_steepness
-                # Clip to prevent explosion: steepness in [0.1, 100.0]
-                log_steepness = jnp.clip(log_steepness, jnp.log(0.1), jnp.log(100.0))
+                # Clip to prevent explosion: steepness in [0.5, 20.0]
+                log_steepness = jnp.clip(log_steepness, jnp.log(0.5), jnp.log(20.0))
                 m_kappa = m ** (-kappa)
                 log_steepness_bar = m_kappa * log_steepness + (1 - m_kappa) * log_steepness_bar
 
@@ -657,15 +657,23 @@ def da_update(state: DualAveragingState, accept_stat: float, target_accept: floa
 
 def da_reset(state: DualAveragingState) -> DualAveragingState:
     """Reset the counter and stats, but keep the current step size as the new target (mu).
-    
+
     Used at the start of a new adaptation window.
+
+    IMPORTANT: Uses the smoothed estimate (log_step_bar) if available, not the noisy
+    estimate (log_step). This prevents drift when resetting after mass matrix updates.
     """
-    current_step = state.log_step
+    # Use smoothed estimate if we have enough samples, otherwise fall back to noisy
+    if state.count > 0:
+        current_step = state.log_step_bar
+    else:
+        current_step = state.log_step
+
     return DualAveragingState(
         log_step=current_step,
-        log_step_bar=0.0,
+        log_step_bar=current_step,  # Initialize to current best, not 0
         H_bar=0.0,
-        mu=current_step, # Reset target to current best guess
+        mu=current_step,  # Reset target to smoothed best guess
         count=0,
         gamma=state.gamma,
         t0=state.t0,
