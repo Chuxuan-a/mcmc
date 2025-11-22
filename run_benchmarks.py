@@ -1,83 +1,406 @@
 """
-Comprehensive benchmarking script for MCMC samplers across multiple targets.
+Comprehensive MCMC benchmarking script with adaptive warmup.
 
-This script runs all sampler-target combinations, collects results, and generates
-comparison reports.
+This script runs all sampler-target combinations using the adaptive warmup
+framework. Mass matrix learning can be enabled (default) or disabled.
 
 Usage:
-    python run_benchmarks.py --output-dir results --dim 10
-    python run_benchmarks.py --samplers hmc nuts --targets standard_normal ill_conditioned_gaussian
-    python run_benchmarks.py --quick  # Fast test with reduced parameters
+    # With mass matrix learning (default)
+    python run_benchmarks.py --dim 20 --targets standard_normal ill_conditioned_gaussian
+    python run_benchmarks.py --dim 10 --all-targets --output-dir results
+
+    # Without mass matrix learning (use identity matrix)
+    python run_benchmarks.py --dim 10 --all-targets --no-mass-matrix --output-dir results_no_mass
 """
 
 import argparse
 import json
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Dict, List
 import pandas as pd
+import numpy as np
 
 import jax
 import jax.numpy as jnp
-from jax import random
+from jax import random, grad
+import arviz as az
 
 from benchmarks.targets import get_target, TargetDistribution
-from test_samplers import run_sampler, compute_diagnostics, check_summary_statistics
+from tuning.adaptation import run_adaptive_warmup
+from samplers.HMC import hmc_run
+from samplers.NUTS import nuts_run
+from samplers.GRAHMC import rahmc_run, get_friction_schedule
+from samplers.RWMH import rwMH_run
+from tuning.dual_averaging import dual_averaging_tune_rwmh
 
 
-def run_single_benchmark(
+def compute_diagnostics(samples: jnp.ndarray) -> Dict:
+    """Compute convergence diagnostics and summary statistics."""
+    n_samples, n_chains, n_dim = samples.shape
+
+    # Convert to ArviZ InferenceData format: (chain, draw, *shape)
+    samples_for_arviz = np.array(samples).transpose(1, 0, 2)
+
+    idata = az.from_dict(
+        posterior={"x": samples_for_arviz},
+        coords={"dim": np.arange(n_dim)},
+        dims={"x": ["dim"]}
+    )
+
+    # Compute split R-hat (rank-normalized)
+    rhat = az.rhat(idata, var_names=["x"])
+    rhat_values = rhat["x"].values
+
+    # Compute ESS
+    ess_bulk = az.ess(idata, var_names=["x"], method="bulk")["x"].values
+    ess_tail = az.ess(idata, var_names=["x"], method="tail")["x"].values
+
+    # Summary statistics (includes mean, mcse_mean, sd, etc.)
+    summary = az.summary(idata, var_names=["x"])
+
+    return {
+        "rhat_max": float(np.max(rhat_values)),
+        "rhat_mean": float(np.mean(rhat_values)),
+        "ess_bulk_min": float(np.min(ess_bulk)),
+        "ess_bulk_mean": float(np.mean(ess_bulk)),
+        "ess_tail_min": float(np.min(ess_tail)),
+        "ess_tail_mean": float(np.mean(ess_tail)),
+        "mean_estimate": np.mean(samples_for_arviz, axis=(0, 1)),
+        "std_estimate": np.std(samples_for_arviz, axis=(0, 1)),
+        "summary": summary,  # Add summary for z-score test
+    }
+
+
+def check_summary_statistics(diagnostics: Dict, target: TargetDistribution, z_threshold: float = 5.0) -> bool:
+    """Check if estimated mean matches true values using z-score test.
+
+    Uses Monte Carlo Standard Error (MCSE) to compute z-scores for mean estimates.
+    A z-score > threshold indicates the estimate is inconsistent with the true value
+    beyond what Monte Carlo noise would explain.
+
+    Args:
+        diagnostics: Dictionary containing summary statistics with 'summary' from ArviZ
+        target: TargetDistribution with true mean/covariance
+        z_threshold: Maximum acceptable z-score (default: 5.0, ~5-sigma test)
+
+    Returns:
+        True if z-score test passes, False otherwise
+    """
+    if target.true_mean is None or target.true_cov is None:
+        return True  # Skip check if true values unknown
+
+    summary = diagnostics["summary"]
+    means = summary["mean"].values
+    mcse = summary["mcse_mean"].values
+    true_mean = np.array(target.true_mean)
+
+    # Calculate Z-scores: (estimate - truth) / MCSE
+    z_scores = (means - true_mean) / (mcse + 1e-16)
+    max_z = np.max(np.abs(z_scores))
+
+    # Pass if all z-scores are within threshold
+    return max_z < z_threshold
+
+
+def run_trajectory_length_grid_search(
     sampler: str,
     target: TargetDistribution,
     key: jnp.ndarray,
-    n_chains: int = 4,
-    target_ess: int = 1000,
-    batch_size: int = 2000,
-    max_samples: int = 50000,
-    schedule_type: str = "constant",
-    fixed_budget: int = None,
+    n_chains: int,
+    num_warmup: int,
+    target_ess: int,
+    batch_size: int,
+    max_samples: int,
+    schedule_type: str,
+    num_steps_grid: List[int],
+    learn_mass_matrix: bool = True,
 ) -> Dict:
-    """Run a single sampler-target benchmark and return results."""
+    """Run grid search over trajectory lengths and return best result.
+
+    For HMC and GRAHMC, we test multiple trajectory lengths (L) and select
+    the one that achieves the best ESS per gradient evaluation.
+
+    Returns:
+        Best result dict with additional 'grid_search_info' field
+    """
+    print(f"\n{'#'*80}")
+    print(f"GRID SEARCH: Testing trajectory lengths {num_steps_grid}")
+    print(f"{'#'*80}")
+
+    grid_results = []
+
+    for num_steps in num_steps_grid:
+        key, subkey = random.split(key)
+
+        print(f"\n--- Testing L={num_steps} ---")
+
+        result = run_single_benchmark_with_L(
+            sampler=sampler,
+            target=target,
+            key=subkey,
+            n_chains=n_chains,
+            num_warmup=num_warmup,
+            target_ess=target_ess,
+            batch_size=batch_size,
+            max_samples=max_samples,
+            schedule_type=schedule_type,
+            num_steps=num_steps,
+            learn_mass_matrix=learn_mass_matrix,
+        )
+
+        # Calculate ESS per gradient for ranking
+        if result.get("error") is None:
+            n_gradients = result["total_samples"] * num_steps
+            ess_per_grad = result["ess_bulk_min"] / n_gradients if n_gradients > 0 else 0
+            result["n_gradients"] = n_gradients
+            result["ess_per_gradient"] = ess_per_grad
+        else:
+            result["n_gradients"] = 0
+            result["ess_per_gradient"] = 0
+
+        grid_results.append(result)
+
+    # Select best result based on ESS per gradient (among passing runs only)
+    passing_results = [r for r in grid_results if r.get("overall_pass", False)]
+
+    if passing_results:
+        # Choose best among passing runs
+        best_result = max(passing_results, key=lambda r: r["ess_per_gradient"])
+    else:
+        # No passing runs - choose best ESS/grad anyway (mark as failed)
+        best_result = max(grid_results, key=lambda r: r["ess_per_gradient"])
+        print("\n!!! WARNING: NO L VALUES PASSED ALL CHECKS !!!")
+        print("!!! Selecting best ESS/grad among failed runs !!!")
 
     print(f"\n{'='*80}")
+    print(f"GRID SEARCH COMPLETE")
+    print(f"{'='*80}")
+    print(f"Results by trajectory length:")
+    for r in grid_results:
+        status = "[ERROR]" if r.get("error") else ("[PASS]" if r.get("overall_pass") else "[FAIL]")
+        print(f"  L={r['num_steps']:2d}: ESS/grad={r['ess_per_gradient']:.6f}, "
+              f"ESS={r['ess_bulk_min']:7.1f}, samples={r['total_samples']:5d} {status}")
+
+    print(f"\n>>> BEST: L={best_result['num_steps']} (ESS/grad={best_result['ess_per_gradient']:.6f})")
+
+    # Add grid search metadata
+    best_result["grid_search_info"] = {
+        "tested_L_values": num_steps_grid,
+        "all_results": [{
+            "num_steps": r["num_steps"],
+            "ess_per_gradient": r["ess_per_gradient"],
+            "ess_bulk_min": r["ess_bulk_min"],
+            "total_samples": r["total_samples"],
+            "overall_pass": r.get("overall_pass", False),
+        } for r in grid_results],
+    }
+
+    return best_result
+
+
+def run_single_benchmark_with_L(
+    sampler: str,
+    target: TargetDistribution,
+    key: jnp.ndarray,
+    n_chains: int,
+    num_warmup: int,
+    target_ess: int,
+    batch_size: int,
+    max_samples: int,
+    schedule_type: str,
+    num_steps: int,
+    learn_mass_matrix: bool = True,
+) -> Dict:
+    """Run a single benchmark with a specific trajectory length.
+
+    This is the internal function called by grid search.
+    """
+    print(f"\n{'='*80}")
     print(f"BENCHMARK: {sampler.upper()} on {target.name}")
+    if sampler in ["grahmc", "rahmc"]:
+        print(f"  Schedule: {schedule_type}")
+    print(f"  Trajectory Length: L={num_steps}")
     print(f"{'='*80}")
 
     start_time = time.time()
 
     try:
-        # Use fixed budget mode if specified
-        if fixed_budget is not None:
-            samples, log_probs, metadata = run_sampler(
-                sampler=sampler,
-                key=key,
-                target=target,
-                n_chains=n_chains,
-                target_ess=fixed_budget,  # Use as sample count in fixed mode
-                batch_size=fixed_budget,  # Single batch
-                max_samples=fixed_budget,
-                schedule_type=schedule_type,
+        # Initialize positions
+        key, init_key = random.split(key)
+        if target.init_sampler is not None:
+            init_pos = target.init_sampler(init_key, n_chains)
+        else:
+            init_pos = random.normal(init_key, (n_chains, target.dim)) * 0.1
+
+        # Create gradient function from log_prob_fn
+        def grad_log_prob_fn(x):
+            """Compute gradient of log probability at x."""
+            return grad(lambda y: jnp.sum(target.log_prob_fn(y)))(x)
+
+        # Adaptive warmup phase
+        print("\n[Phase 1] Adaptive Warmup (tuning step size + mass matrix)...")
+        warmup_start = time.time()
+
+        if sampler == "rwmh":
+            # RWMH uses old dual averaging (no mass matrix)
+            tuned_scale, _ = dual_averaging_tune_rwmh(
+                key, target.log_prob_fn, init_pos,
+                target_accept=0.234, max_iter=1000
+            )
+            step_size = tuned_scale
+            inv_mass_matrix = None
+            warmup_pos = init_pos
+            warmup_info = {"scale": tuned_scale}
+
+        elif sampler in ["hmc", "nuts", "grahmc", "rahmc"]:
+            # Use adaptive warmup for HMC/NUTS/GRAHMC
+            sampler_kwargs = {}
+            if sampler == "hmc":
+                sampler_kwargs["num_steps"] = num_steps  # Use grid search value
+            elif sampler == "nuts":
+                sampler_kwargs["max_tree_depth"] = 10
+            elif sampler in ["grahmc", "rahmc"]:
+                sampler_kwargs["num_steps"] = num_steps  # Use grid search value
+                sampler_kwargs["gamma"] = 1.0
+                sampler_kwargs["steepness"] = 5.0 if schedule_type == "tanh" else 10.0
+                sampler_kwargs["friction_schedule"] = get_friction_schedule(schedule_type)
+
+            sampler_name_map = {"grahmc": "grahmc", "rahmc": "grahmc"}
+            step_size, inv_mass_matrix, warmup_pos, warmup_info = run_adaptive_warmup(
+                sampler_name_map.get(sampler, sampler),
+                target.log_prob_fn,
+                grad_log_prob_fn,  # Use the gradient function we created above
+                init_pos,
+                key,
+                num_warmup=num_warmup,
+                target_accept=0.65,
+                schedule_type=schedule_type if sampler in ["grahmc", "rahmc"] else None,
+                learn_mass_matrix=learn_mass_matrix,
+                **sampler_kwargs
             )
         else:
-            samples, log_probs, metadata = run_sampler(
-                sampler=sampler,
-                key=key,
-                target=target,
-                n_chains=n_chains,
-                target_ess=target_ess,
-                batch_size=batch_size,
-                max_samples=max_samples,
-                schedule_type=schedule_type,
+            raise ValueError(f"Unknown sampler: {sampler}")
+
+        warmup_time = time.time() - warmup_start
+        print(f"  Warmup complete in {warmup_time:.1f}s")
+        print(f"  Step size: {step_size:.4f}")
+        if learn_mass_matrix and inv_mass_matrix is not None:
+            print(f"  Mass matrix range: [{inv_mass_matrix.min():.4f}, {inv_mass_matrix.max():.4f}]")
+        else:
+            print(f"  Mass matrix: Identity (not learned)")
+
+        # Production sampling phase with ADAPTIVE sampling (like original benchmark)
+        print(f"\n[Phase 2] Adaptive Sampling (until ESS >= {target_ess}, max {max_samples} samples)...")
+        print(f"  Collecting in batches of {batch_size} samples")
+        sample_start = time.time()
+
+        all_samples_list = []
+        all_log_probs_list = []
+        total_samples = 0
+        batch_num = 0
+        current_position = warmup_pos
+        final_accept_rate = 0.0
+
+        while total_samples < max_samples:
+            batch_num += 1
+            key, sample_key = random.split(key)
+
+            if sampler == "rwmh":
+                samples_batch, lps_batch, accept_rate, final_state = rwMH_run(
+                    sample_key, target.log_prob_fn, current_position,
+                    num_samples=batch_size, scale=step_size, burn_in=0
+                )
+            elif sampler == "hmc":
+                samples_batch, lps_batch, accept_rate, final_state = hmc_run(
+                    sample_key, target.log_prob_fn, current_position,
+                    step_size=step_size, num_steps=num_steps,  # Use grid search value
+                    num_samples=batch_size, burn_in=0,
+                    inv_mass_matrix=inv_mass_matrix
+                )
+            elif sampler == "nuts":
+                samples_batch, lps_batch, accept_rate, final_state, tree_depths, mean_accept_probs = nuts_run(
+                    sample_key, target.log_prob_fn, current_position,
+                    step_size=step_size, max_tree_depth=10,
+                    num_samples=batch_size, burn_in=0,
+                    inv_mass_matrix=inv_mass_matrix
+                )
+            elif sampler in ["grahmc", "rahmc"]:
+                # EXTRACT TUNED VALUES from warmup_info
+                tuned_gamma = warmup_info.get("gamma", 1.0)
+                tuned_steepness = warmup_info.get("steepness", 5.0)
+
+                friction_schedule = get_friction_schedule(schedule_type)
+                samples_batch, lps_batch, accept_rate, final_state = rahmc_run(
+                    sample_key, target.log_prob_fn, current_position,
+                    step_size=step_size, num_steps=num_steps,  # Use grid search value
+                    gamma=tuned_gamma,  # Use tuned values, not hardcoded!
+                    steepness=tuned_steepness,
+                    num_samples=batch_size, burn_in=0,
+                    inv_mass_matrix=inv_mass_matrix,
+                    friction_schedule=friction_schedule
+                )
+
+            # Continue from where we left off
+            current_position = final_state.position
+            final_accept_rate = float(jnp.mean(accept_rate))
+
+            all_samples_list.append(samples_batch)
+            all_log_probs_list.append(lps_batch)
+            total_samples += batch_size
+
+            # Concatenate all samples collected so far
+            samples = jnp.concatenate(all_samples_list, axis=0)
+
+            # Compute ESS to check if we've reached target
+            samples_for_arviz = np.array(samples).transpose(1, 0, 2)
+            idata = az.from_dict(
+                posterior={"x": samples_for_arviz},
+                coords={"dim": np.arange(target.dim)},
+                dims={"x": ["dim"]}
             )
+            ess_bulk = az.ess(idata, var_names=["x"], method="bulk")["x"].values
+            min_ess = float(np.min(ess_bulk))
+            mean_ess = float(np.mean(ess_bulk))
+
+            print(f"  Batch {batch_num}: {total_samples} total samples, min ESS = {min_ess:.1f}, mean ESS = {mean_ess:.1f}")
+
+            if min_ess >= target_ess:
+                print(f"  Target ESS reached!")
+                break
+
+        # Final concatenation
+        samples = jnp.concatenate(all_samples_list, axis=0)
+        log_probs = jnp.concatenate(all_log_probs_list, axis=0)
+
+        sample_time = time.time() - sample_start
+        print(f"  Sampling complete in {sample_time:.1f}s")
+        print(f"  Total samples: {total_samples}")
+        print(f"  Final acceptance rate: {final_accept_rate:.3f}")
+
+        # Set metadata
+        if sampler == "rwmh":
+            sampler_metadata = {"scale": step_size}
+        elif sampler == "hmc":
+            sampler_metadata = {"step_size": step_size, "num_steps": num_steps}
+        elif sampler == "nuts":
+            sampler_metadata = {"step_size": step_size, "max_tree_depth": 10}
+        elif sampler in ["grahmc", "rahmc"]:
+            sampler_metadata = {
+                "step_size": step_size,
+                "num_steps": num_steps,
+                "gamma": warmup_info.get("gamma", 1.0),
+                "steepness": warmup_info.get("steepness", 5.0),
+                "schedule": schedule_type
+            }
 
         # Compute diagnostics
+        print("\n[Phase 3] Computing diagnostics...")
         diagnostics = compute_diagnostics(samples)
+        stats_pass = check_summary_statistics(diagnostics, target, z_threshold=5.0)
 
-        # Check summary statistics
-        stats_pass = check_summary_statistics(diagnostics, target, tolerance=0.15, total_samples=samples.shape[0])
-
-        elapsed_time = time.time() - start_time
+        total_time = time.time() - start_time
 
         # Compile results
         results = {
@@ -86,52 +409,56 @@ def run_single_benchmark(
             "schedule": schedule_type if sampler in ["grahmc", "rahmc"] else None,
             "dim": target.dim,
             "n_chains": n_chains,
+            "num_warmup": num_warmup,
+            "batch_size": batch_size,
+            "max_samples": max_samples,
+            "total_samples": total_samples,
             "target_ess": target_ess,
-            "total_samples": metadata["total_samples"],
-            "accept_rate": metadata["accept_rate"],
-            "elapsed_time": elapsed_time,
+            "warmup_time": warmup_time,
+            "sample_time": sample_time,
+            "total_time": total_time,
+            "accept_rate": final_accept_rate,
             # Diagnostics
             "rhat_max": diagnostics["rhat_max"],
             "rhat_mean": diagnostics["rhat_mean"],
             "ess_bulk_min": diagnostics["ess_bulk_min"],
             "ess_bulk_mean": diagnostics["ess_bulk_mean"],
             "ess_tail_min": diagnostics["ess_tail_min"],
-            # Pass/fail
+            "ess_tail_mean": diagnostics["ess_tail_mean"],
+            # Pass/fail criteria
             "rhat_pass": diagnostics["rhat_max"] < 1.01,
             "ess_pass": diagnostics["ess_bulk_min"] >= target_ess,
-            "ess_tail_pass": diagnostics["ess_tail_min"] >= target_ess * 0.5,  # 50% threshold for tail
+            "ess_tail_pass": diagnostics["ess_tail_min"] >= target_ess * 0.5,
             "stats_pass": stats_pass,
-            "overall_pass": (diagnostics["rhat_max"] < 1.01 and
-                           diagnostics["ess_bulk_min"] >= target_ess and
-                           diagnostics["ess_tail_min"] >= target_ess * 0.5 and
-                           stats_pass),
+            "overall_pass": (
+                diagnostics["rhat_max"] < 1.01 and
+                diagnostics["ess_bulk_min"] >= target_ess and
+                diagnostics["ess_tail_min"] >= target_ess * 0.5 and
+                stats_pass
+            ),
         }
 
-        # Add sampler-specific parameters
-        if sampler == "rwmh":
-            results["scale"] = metadata["scale"]
-        elif sampler in ["hmc", "nuts"]:
-            results["step_size"] = metadata["step_size"]
-            if sampler == "hmc":
-                results["num_steps"] = metadata["num_steps"]
-            else:
-                results["max_tree_depth"] = metadata["max_tree_depth"]
-        elif sampler in ["grahmc", "rahmc"]:
-            results["step_size"] = metadata["step_size"]
-            results["num_steps"] = metadata["num_steps"]
-            results["gamma"] = metadata["gamma"]
-            if "steepness" in metadata:
-                results["steepness"] = metadata.get("steepness")
+        # Add sampler-specific metadata
+        results.update(sampler_metadata)
 
-        print(f"\n[PASS]" if results["overall_pass"] else f"\n[FAIL]")
-        print(f"Time: {elapsed_time:.2f}s | ESS: {results['ess_bulk_min']:.1f} | Accept: {results['accept_rate']:.3f}")
+        # Add mass matrix info
+        results["mass_matrix_learned"] = learn_mass_matrix
+        if learn_mass_matrix and inv_mass_matrix is not None:
+            results["mass_matrix_min"] = float(inv_mass_matrix.min())
+            results["mass_matrix_max"] = float(inv_mass_matrix.max())
+            results["mass_matrix_mean"] = float(inv_mass_matrix.mean())
+
+        status = "[PASS]" if results["overall_pass"] else "[FAIL]"
+        print(f"\n{status}")
+        print(f"  R-hat: {results['rhat_max']:.4f} | ESS: {results['ess_bulk_min']:.0f} | Time: {total_time:.1f}s")
 
         return results
 
     except Exception as e:
-        elapsed_time = time.time() - start_time
+        total_time = time.time() - start_time
         print(f"\n[ERROR] {str(e)}")
-        print(f"Time: {elapsed_time:.1f}s")
+        import traceback
+        traceback.print_exc()
 
         return {
             "sampler": sampler,
@@ -139,7 +466,7 @@ def run_single_benchmark(
             "schedule": schedule_type if sampler in ["grahmc", "rahmc"] else None,
             "dim": target.dim,
             "error": str(e),
-            "elapsed_time": elapsed_time,
+            "total_time": total_time,
             "overall_pass": False,
         }
 
@@ -150,14 +477,22 @@ def run_all_benchmarks(
     grahmc_schedules: List[str],
     dim: int,
     n_chains: int,
+    num_warmup: int,
     target_ess: int,
     batch_size: int,
     max_samples: int,
     seed: int,
     output_dir: str,
-    fixed_budget: int = None,
+    num_steps_grid: List[int] = None,
+    learn_mass_matrix: bool = True,
 ) -> pd.DataFrame:
-    """Run all sampler-target combinations and save results."""
+    """Run all sampler-target combinations and save results.
+
+    Args:
+        num_steps_grid: Grid of trajectory lengths to test for HMC/GRAHMC.
+                       If None, uses default [8, 16, 24, 32, 48, 64].
+        learn_mass_matrix: If True, learn diagonal mass matrix. If False, use identity.
+    """
 
     # Set up JAX
     jax.config.update("jax_enable_x64", True)
@@ -166,41 +501,71 @@ def run_all_benchmarks(
     # Create output directory
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
+    # Default grid for trajectory length if not specified
+    if num_steps_grid is None:
+        num_steps_grid = [8, 16, 24, 32, 48, 64]
+
     all_results = []
 
     # Iterate over all combinations
     for target_name in targets:
+        print(f"\n\n{'#'*80}")
+        print(f"# TARGET: {target_name.upper()} (dim={dim})")
+        print(f"{'#'*80}")
+
         target = get_target(target_name, dim=dim)
 
         for sampler in samplers:
             if sampler in ["grahmc", "rahmc"]:
-                # Test each schedule for GRAHMC
+                # Test each schedule for GRAHMC with grid search over L
                 for schedule in grahmc_schedules:
                     key, subkey = random.split(key)
-                    results = run_single_benchmark(
+                    results = run_trajectory_length_grid_search(
                         sampler=sampler,
                         target=target,
                         key=subkey,
                         n_chains=n_chains,
+                        num_warmup=num_warmup,
                         target_ess=target_ess,
                         batch_size=batch_size,
                         max_samples=max_samples,
                         schedule_type=schedule,
-                        fixed_budget=fixed_budget,
+                        num_steps_grid=num_steps_grid,
+                        learn_mass_matrix=learn_mass_matrix,
                     )
                     all_results.append(results)
-            else:
-                # Other samplers don't have schedules
+            elif sampler == "hmc":
+                # HMC uses grid search over L
                 key, subkey = random.split(key)
-                results = run_single_benchmark(
+                results = run_trajectory_length_grid_search(
                     sampler=sampler,
                     target=target,
                     key=subkey,
                     n_chains=n_chains,
+                    num_warmup=num_warmup,
                     target_ess=target_ess,
                     batch_size=batch_size,
                     max_samples=max_samples,
-                    fixed_budget=fixed_budget,
+                    schedule_type="constant",  # Unused for HMC
+                    num_steps_grid=num_steps_grid,
+                    learn_mass_matrix=learn_mass_matrix,
+                )
+                all_results.append(results)
+            else:
+                # RWMH and NUTS don't use trajectory length grid search
+                key, subkey = random.split(key)
+                results = run_single_benchmark_with_L(
+                    sampler=sampler,
+                    target=target,
+                    key=subkey,
+                    n_chains=n_chains,
+                    num_warmup=num_warmup,
+                    target_ess=target_ess,
+                    batch_size=batch_size,
+                    max_samples=max_samples,
+                    schedule_type="constant",  # Unused for RWMH/NUTS
+                    num_steps=20,  # Unused for RWMH/NUTS
+                    learn_mass_matrix=learn_mass_matrix,
                 )
                 all_results.append(results)
 
@@ -211,21 +576,29 @@ def run_all_benchmarks(
     csv_path = Path(output_dir) / "benchmark_results.csv"
     json_path = Path(output_dir) / "benchmark_results.json"
 
-    # Round numeric columns to reasonable precision for readability
+    # Round numeric columns
     numeric_cols = df.select_dtypes(include=[float]).columns
     df[numeric_cols] = df[numeric_cols].round(4)
 
     df.to_csv(csv_path, index=False)
-    print(f"\n[OK] Results saved to {csv_path}")
+    print(f"\n\n[OK] Results saved to {csv_path}")
 
-    # Round all numeric values in results for JSON output
+    # Save JSON
     def round_floats(obj):
         if isinstance(obj, float):
             return round(obj, 4)
+        elif isinstance(obj, bool):
+            return obj
+        elif isinstance(obj, (int, str, type(None))):
+            return obj
         elif isinstance(obj, dict):
             return {k: round_floats(v) for k, v in obj.items()}
         elif isinstance(obj, list):
             return [round_floats(x) for x in obj]
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        elif isinstance(obj, (np.integer, np.floating)):
+            return float(obj)
         return obj
 
     rounded_results = round_floats(all_results)
@@ -239,178 +612,126 @@ def run_all_benchmarks(
 def print_summary(df: pd.DataFrame):
     """Print a summary of benchmark results."""
 
-    print(f"\n{'='*80}")
+    print(f"\n\n{'='*80}")
     print("BENCHMARK SUMMARY")
     print(f"{'='*80}")
 
     print(f"\nTotal experiments: {len(df)}")
-    print(f"Passed: {df['overall_pass'].sum()} ({100*df['overall_pass'].mean():.1f}%)")
-    print(f"Failed: {(~df['overall_pass']).sum()}")
+    passed = df['overall_pass'].sum()
+    total = len(df)
+    print(f"Passed: {passed}/{total} ({100*passed/total:.1f}%)")
+    print(f"Failed: {total - passed}")
 
-    if 'error' in df.columns:
-        errors = df['error'].notna().sum()
-        if errors > 0:
-            print(f"Errors: {errors}")
+    # Breakdown by sampler
+    print(f"\nBy Sampler:")
+    for sampler in df['sampler'].unique():
+        sampler_df = df[df['sampler'] == sampler]
+        passed = sampler_df['overall_pass'].sum()
+        total = len(sampler_df)
+        print(f"  {sampler:10s}: {passed}/{total} ({100*passed/total:.1f}%)")
 
-    print(f"\n{'='*80}")
-    print("RESULTS BY SAMPLER")
-    print(f"{'='*80}")
-
-    sampler_summary = df.groupby('sampler').agg({
-        'overall_pass': ['count', 'sum', 'mean'],
-        'elapsed_time': 'mean',
-        'ess_bulk_min': 'mean',
-        'accept_rate': 'mean',
-    }).round(3)
-    print(sampler_summary)
-
-    print(f"\n{'='*80}")
-    print("RESULTS BY TARGET")
-    print(f"{'='*80}")
-
-    target_summary = df.groupby('target').agg({
-        'overall_pass': ['count', 'sum', 'mean'],
-        'elapsed_time': 'mean',
-        'ess_bulk_min': 'mean',
-    }).round(3)
-    print(target_summary)
-
-    # Find best performer per target
-    print(f"\n{'='*80}")
-    print("BEST SAMPLER PER TARGET (by min ESS)")
-    print(f"{'='*80}")
-
+    # Breakdown by target
+    print(f"\nBy Target:")
     for target in df['target'].unique():
         target_df = df[df['target'] == target]
-        if not target_df.empty:
-            best = target_df.loc[target_df['ess_bulk_min'].idxmax()]
-            sampler_id = best['sampler']
-            if pd.notna(best.get('schedule')):
-                sampler_id += f"-{best['schedule']}"
-            print(f"{target:40s} -> {sampler_id:20s} (ESS={best['ess_bulk_min']:.1f})")
+        passed = target_df['overall_pass'].sum()
+        total = len(target_df)
+        print(f"  {target:30s}: {passed}/{total} ({100*passed/total:.1f}%)")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Run comprehensive MCMC benchmarks across samplers and targets"
-    )
+    parser = argparse.ArgumentParser(description="Run MCMC benchmarks with adaptive warmup")
 
-    parser.add_argument(
-        "--samplers",
-        nargs="+",
-        default=["rwmh", "hmc", "nuts", "grahmc"],
-        choices=["rwmh", "hmc", "nuts", "grahmc", "rahmc"],
-        help="Samplers to benchmark (default: all)"
-    )
+    # Target selection
+    parser.add_argument("--targets", nargs="+", default=None,
+                       help="List of targets to benchmark")
+    parser.add_argument("--all-targets", action="store_true",
+                       help="Run all available targets")
 
-    parser.add_argument(
-        "--targets",
-        nargs="+",
-        default=["standard_normal", "correlated_gaussian", "ill_conditioned_gaussian", "neals_funnel", "log_gamma", "gaussian_mixture"],
-        choices=["standard_normal", "correlated_gaussian", "ill_conditioned_gaussian", "student_t", "log_gamma", "rosenbrock", "neals_funnel", "gaussian_mixture"],
-        help="Target distributions (default: all)"
-    )
+    # Sampler selection
+    parser.add_argument("--samplers", nargs="+",
+                       default=["rwmh", "hmc", "nuts", "grahmc"],
+                       help="List of samplers to benchmark")
+    parser.add_argument("--schedules", nargs="+",
+                       default=["constant", "tanh", "sigmoid", "linear", "sine"],
+                       help="GRAHMC friction schedules to test")
 
-    parser.add_argument(
-        "--grahmc-schedules",
-        nargs="+",
-        default=["constant", "tanh", "sigmoid", "linear", "sine"],
-        choices=["constant", "tanh", "sigmoid", "linear", "sine"],
-        help="GRAHMC friction schedules to test (default: all)"
-    )
+    # Parameters
+    parser.add_argument("--dim", type=int, default=10,
+                       help="Dimensionality of targets")
+    parser.add_argument("--n-chains", type=int, default=4,
+                       help="Number of parallel chains")
+    parser.add_argument("--num-warmup", type=int, default=1000,
+                       help="Number of warmup steps for adaptive tuning")
+    parser.add_argument("--target-ess", type=int, default=1000,
+                       help="Target ESS for adaptive sampling to reach")
+    parser.add_argument("--batch-size", type=int, default=2000,
+                       help="Batch size for adaptive sampling")
+    parser.add_argument("--max-samples", type=int, default=50000,
+                       help="Maximum samples before giving up")
+    parser.add_argument("--num-steps-grid", nargs="+", type=int, default=None,
+                       help="Grid of trajectory lengths to test for HMC/GRAHMC (default: [8, 16, 24, 32, 48, 64])")
+    parser.add_argument("--no-mass-matrix", action="store_true",
+                       help="Disable mass matrix adaptation (use identity matrix)")
 
-    parser.add_argument("--dim", type=int, default=10, help="Dimensionality (default: 10)")
-    parser.add_argument("--chains", type=int, default=4, help="Number of chains (default: 4)")
-    parser.add_argument("--target-ess", type=int, default=1000, help="Target ESS (default: 1000)")
-    parser.add_argument("--batch-size", type=int, default=2000, help="Batch size (default: 2000)")
-    parser.add_argument("--max-samples", type=int, default=50000, help="Max samples (default: 50000)")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
-    parser.add_argument("--output-dir", type=str, default="./benchmark_results", help="Output directory")
-
-    parser.add_argument(
-        "--quick",
-        action="store_true",
-        help="Quick test mode (reduced parameters for fast testing)"
-    )
-
-    parser.add_argument(
-        "--no-confirm",
-        action="store_true",
-        help="Skip confirmation prompt (useful for automation)"
-    )
-
-    parser.add_argument(
-        "--fixed-budget",
-        type=int,
-        default=None,
-        help="Use fixed sample budget instead of adaptive ESS targeting (e.g., --fixed-budget 20000)"
-    )
+    # Output
+    parser.add_argument("--output-dir", type=str, default="benchmark_results",
+                       help="Directory to save results")
+    parser.add_argument("--seed", type=int, default=42,
+                       help="Random seed")
 
     args = parser.parse_args()
 
-    # Quick mode overrides
-    if args.quick:
-        print("\n[QUICK MODE] Using reduced parameters for fast testing")
-        args.dim = 5
-        args.chains = 2
-        args.target_ess = 200
-        args.batch_size = 500
-        args.max_samples = 3000
-        args.samplers = ["hmc", "nuts"]  # Faster samplers only
-        args.targets = ["standard_normal", "ill_conditioned_gaussian"]  # Subset
-        args.grahmc_schedules = ["constant"]  # Just one schedule
+    # Set up targets
+    if args.all_targets:
+        targets = ["standard_normal", "correlated_gaussian", "ill_conditioned_gaussian",
+                  "student_t", "log_gamma", "rosenbrock", "neals_funnel", "gaussian_mixture"]
+    elif args.targets:
+        targets = args.targets
+    else:
+        print("Error: Must specify --targets or --all-targets")
+        return
+
+    learn_mass_matrix = not args.no_mass_matrix
 
     print(f"\n{'='*80}")
-    print("MCMC BENCHMARK SUITE")
-    print(f"{'='*80}")
-    print(f"Samplers: {', '.join(args.samplers)}")
-    print(f"Targets: {', '.join(args.targets)}")
-    if "grahmc" in args.samplers or "rahmc" in args.samplers:
-        print(f"GRAHMC schedules: {', '.join(args.grahmc_schedules)}")
-    print(f"Dimensionality: {args.dim}")
-    print(f"Chains: {args.chains}")
-    if args.fixed_budget:
-        print(f"Mode: Fixed budget ({args.fixed_budget} samples)")
+    if learn_mass_matrix:
+        print("MCMC BENCHMARK SUITE (with Adaptive Warmup + Mass Matrix Tuning)")
     else:
-        print(f"Mode: Adaptive ESS targeting (target: {args.target_ess})")
+        print("MCMC BENCHMARK SUITE (with Adaptive Warmup, NO Mass Matrix)")
+    print(f"{'='*80}")
+    print(f"Targets: {', '.join(targets)}")
+    print(f"Samplers: {', '.join(args.samplers)}")
+    print(f"Dimension: {args.dim}")
+    print(f"Chains: {args.n_chains}")
+    print(f"Warmup: {args.num_warmup} steps")
+    print(f"Batch size: {args.batch_size} samples per batch")
+    print(f"Max samples: {args.max_samples}")
+    print(f"Target ESS: {args.target_ess}")
+    print(f"Mass matrix: {'Learned' if learn_mass_matrix else 'Identity (disabled)'}")
     print(f"Output: {args.output_dir}")
-
-    # Calculate total experiments
-    n_grahmc = args.samplers.count("grahmc") + args.samplers.count("rahmc")
-    n_other = len(args.samplers) - n_grahmc
-    total_experiments = len(args.targets) * (n_other + n_grahmc * len(args.grahmc_schedules))
-    print(f"\nTotal experiments to run: {total_experiments}")
-
-    if not args.no_confirm:
-        input("\nPress Enter to start benchmarking (or Ctrl+C to cancel)...")
+    print(f"{'='*80}\n")
 
     # Run benchmarks
-    start_time = time.time()
     df = run_all_benchmarks(
         samplers=args.samplers,
-        targets=args.targets,
-        grahmc_schedules=args.grahmc_schedules,
+        targets=targets,
+        grahmc_schedules=args.schedules,
         dim=args.dim,
-        n_chains=args.chains,
-        target_ess=args.target_ess,
+        n_chains=args.n_chains,
+        num_warmup=args.num_warmup,
         batch_size=args.batch_size,
         max_samples=args.max_samples,
+        target_ess=args.target_ess,
         seed=args.seed,
         output_dir=args.output_dir,
-        fixed_budget=args.fixed_budget,
+        num_steps_grid=args.num_steps_grid,
+        learn_mass_matrix=learn_mass_matrix,
     )
-
-    total_time = time.time() - start_time
 
     # Print summary
     print_summary(df)
 
-    print(f"\n{'='*80}")
-    print(f"Total time: {total_time/60:.1f} minutes")
-    print(f"{'='*80}")
-
-    return 0 if df['overall_pass'].all() else 1
-
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

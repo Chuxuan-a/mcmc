@@ -69,6 +69,7 @@ def run_adaptive_warmup(
     target_accept: float = 0.65,
     schedule_type: Optional[str] = None,
     update_freq: int = 100,  # Update DA every N steps instead of every step
+    learn_mass_matrix: bool = True,  # If False, skip mass matrix learning (use identity)
     **kwargs,
 ) -> Tuple[float, Optional[jnp.ndarray], jnp.ndarray, Dict]:
     """Run optimized windowed adaptation to find step_size and mass_matrix.
@@ -91,9 +92,11 @@ def run_adaptive_warmup(
         target_accept: Target acceptance rate
         schedule_type: Friction schedule for GRAHMC ('constant', 'tanh', etc.)
         update_freq: Update dual averaging every N steps (default: 100)
+        learn_mass_matrix: If True, learn diagonal mass matrix via Welford. If False, use identity.
 
     Returns:
         (step_size, inv_mass_matrix, final_position, info_dict)
+        inv_mass_matrix is None if learn_mass_matrix=False
     """
     n_chains, n_dim = initial_position.shape
 
@@ -132,11 +135,15 @@ def run_adaptive_warmup(
     # Run Windowed Adaptation
     welford_state = None
 
+    # If not learning mass matrix, keep identity throughout and skip Welford
+    if not learn_mass_matrix:
+        print("  [Mass matrix learning disabled - using identity]")
+
     for start_idx, end_idx, phase in schedule:
         window_len = end_idx - start_idx
 
-        # Reset Welford at the start of a 'slow' window
-        if phase == 'slow':
+        # Reset Welford at the start of a 'slow' window (only if learning mass matrix)
+        if phase == 'slow' and learn_mass_matrix:
             welford_state = welford_init(n_dim)
 
         # OPTIMIZATION: Run sampler in batches instead of 1 step at a time
@@ -197,8 +204,8 @@ def run_adaptive_warmup(
             avg_accept = float(jnp.mean(accept_rate))
             da_state = da_update(da_state, avg_accept, target_accept)
 
-            # Update Welford (Mass Matrix) if in slow phase
-            if phase == 'slow' and sampler in ["hmc", "nuts", "grahmc", "rahmc"]:
+            # Update Welford (Mass Matrix) if in slow phase and learning mass matrix
+            if phase == 'slow' and learn_mass_matrix and sampler in ["hmc", "nuts", "grahmc", "rahmc"]:
                 # Accumulate all samples from this batch
                 # samples_batch shape: (num_samples, n_chains, n_dim)
                 for sample in samples_batch:
@@ -206,19 +213,20 @@ def run_adaptive_warmup(
 
         # End of Window Actions
         if phase == 'slow':
-            # 1. Estimate Variance
-            _, variance = welford_covariance(welford_state)
+            if learn_mass_matrix:
+                # 1. Estimate Variance
+                _, variance = welford_covariance(welford_state)
 
-            # 2. Regularize (Stan approach)
-            n_samples = welford_state.count
-            regularizer = 1e-3 * 5.0 / (n_samples + 5.0)
-            variance = variance * (n_samples / (n_samples + 5.0)) + regularizer
+                # 2. Regularize (Stan approach)
+                n_samples = welford_state.count
+                regularizer = 1e-3 * 5.0 / (n_samples + 5.0)
+                variance = variance * (n_samples / (n_samples + 5.0)) + regularizer
 
-            # 3. Update Mass Matrix
-            inv_mass_matrix = variance
-            print(f"  Window finished. Updated Mass Matrix. Range: [{jnp.min(variance):.4f}, {jnp.max(variance):.4f}]")
+                # 3. Update Mass Matrix
+                inv_mass_matrix = variance
+                print(f"  Window finished. Updated Mass Matrix. Range: [{jnp.min(variance):.4f}, {jnp.max(variance):.4f}]")
 
-            # 4. Reset Dual Averaging
+            # 4. Reset Dual Averaging (always, even without mass matrix learning)
             da_state = da_reset(da_state)
 
     final_step_size = float(jnp.exp(da_state.log_step_bar))
@@ -263,6 +271,7 @@ def run_adaptive_warmup(
         "elapsed_time": elapsed_time,
         "final_step_size": final_step_size,
         "inv_mass_matrix": inv_mass_matrix,
+        "mass_matrix_learned": learn_mass_matrix,
     }
 
     # Add GRAHMC-specific parameters to info

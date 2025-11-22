@@ -67,11 +67,15 @@ def dual_averaging_tune_rwmh(
     converged_count = 0
     converged_iter = max_iter
 
+    # Track evolving chain position (don't always restart from init_position)
+    current_position = init_position
+
     for m in range(1, max_iter + 1):
         key, subkey = random.split(key)
-        _, _, accept_rate, _ = rwMH_run(
-            subkey, log_prob_fn, init_position, num_samples=n_samples_per_tune, scale=float(scale), burn_in=0
+        _, _, accept_rate, final_state = rwMH_run(
+            subkey, log_prob_fn, current_position, num_samples=n_samples_per_tune, scale=float(scale), burn_in=0
         )
+        current_position = final_state.position  # Evolve chain
         alpha = float(jnp.mean(accept_rate))
 
         # Dual averaging update
@@ -180,14 +184,18 @@ def dual_averaging_tune_hmc(
     converged_count = 0
     converged_iter = max_iter
 
+    # Track evolving chain position (don't always restart from init_position)
+    current_position = init_position
+
     for m in range(1, max_iter + 1):
         key, subkey = random.split(key)
         # Run HMC to collect samples and get acceptance statistics
-        _, _, accept_rate, _ = hmc_run(
-            subkey, log_prob_fn, init_position,
+        _, _, accept_rate, final_state = hmc_run(
+            subkey, log_prob_fn, current_position,
             step_size=float(step_size), num_steps=num_steps,
             num_samples=n_samples_per_tune, burn_in=0
         )
+        current_position = final_state.position  # Evolve chain
         # Use mean acceptance rate across chains
         alpha = float(jnp.mean(accept_rate))
 
@@ -302,14 +310,18 @@ def dual_averaging_tune_nuts(
     converged_count = 0
     converged_iter = max_iter
 
+    # Track evolving chain position (don't always restart from init_position)
+    current_position = init_position
+
     for m in range(1, max_iter + 1):
         key, subkey = random.split(key)
         # Run NUTS to collect samples and get acceptance statistics
-        _, _, _, _, tree_depths, mean_accept_probs = nuts_run(
-            subkey, log_prob_fn, init_position,
+        _, _, _, final_state, tree_depths, mean_accept_probs = nuts_run(
+            subkey, log_prob_fn, current_position,
             step_size=float(step_size), max_tree_depth=max_tree_depth,
             num_samples=n_samples_per_tune, burn_in=0
         )
+        current_position = final_state.position  # Evolve chain
         # Use the mean of Metropolis acceptance probabilities from leapfrog trajectories
         # This is the standard statistic for NUTS dual averaging (Hoffman & Gelman 2014)
         alpha = float(jnp.mean(mean_accept_probs))
