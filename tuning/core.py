@@ -655,10 +655,17 @@ def tune_and_sample_grahmc_grid(
         )
 
         # Then, fine-tune friction parameters holding step size and mass matrix fixed
-        # (This is a heuristic choice; could also be a larger joint optimization)
+        # CRITICAL: Pass the learned mass matrix so friction is tuned on sphered geometry
+        key, tune_key2 = random.split(key)
         step_size, gamma, steepness, tune_history = coordinate_wise_tune_grahmc(
-            tune_key, log_prob_fn, warmup_position,
-            num_steps=L, schedule_type=schedule_type, max_cycles=max_cycles
+            key=tune_key2,
+            log_prob_fn=log_prob_fn,
+            grad_log_prob_fn=None,  # Not used internally
+            init_position=warmup_position,
+            num_steps=L,
+            schedule_type=schedule_type,
+            max_cycles=max_cycles,
+            inv_mass_matrix=inv_mass_matrix,
         )
 
         print(f"\n  ADAPTIVE SAMPLING")

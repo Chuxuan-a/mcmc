@@ -52,7 +52,7 @@ def dual_averaging_tune_rwmh(
     initial_scale = 2.38 / jnp.sqrt(d)
     log_scale = jnp.log(initial_scale)
     mu = log_scale  # Target around the initial scale
-    log_scale_bar = 0.0
+    log_scale_bar = log_scale  # Initialize to initial value, not 0.0
     H_bar = 0.0
 
     scale = jnp.exp(log_scale)
@@ -165,7 +165,7 @@ def dual_averaging_tune_hmc(
     initial_step_size = 0.5 / jnp.sqrt(d)  # Scale inversely with sqrt(dim)
     log_step_size = jnp.log(initial_step_size)
     mu = log_step_size  # Set target around initial
-    log_step_size_bar = 0.0
+    log_step_size_bar = log_step_size  # Initialize to initial value, not 0.0
     H_bar = 0.0
 
     step_size = jnp.exp(log_step_size)
@@ -286,7 +286,7 @@ def dual_averaging_tune_nuts(
     initial_step_size = 0.5 / jnp.sqrt(d)  # Scale inversely with sqrt(dim)
     log_step_size = jnp.log(initial_step_size)
     mu = log_step_size  # Set target around initial
-    log_step_size_bar = 0.0
+    log_step_size_bar = log_step_size  # Initialize to initial value, not 0.0
     H_bar = 0.0
 
     step_size = jnp.exp(log_step_size)
@@ -437,25 +437,29 @@ def coordinate_wise_tune_grahmc(
 
     n_samples_per_tune = 100
 
+    # Track evolving chain position (don't always restart from init_position)
+    current_position = init_position
+
     for cycle in range(max_cycles):
         print(f"    Cycle {cycle + 1}/{max_cycles}")
 
         # ===== 1. Tune step_size (hold gamma, steepness fixed) =====
         log_step_size = jnp.log(step_size)
         mu_step = log_step_size
-        log_step_size_bar = 0.0
+        log_step_size_bar = log_step_size  # Initialize to current value, not 0.0
         H_bar_step = 0.0
 
         for m in range(1, max_iter_per_param + 1):
             key, subkey = random.split(key)
-            _, _, accept_rate, _ = rahmc_run(
-                subkey, log_prob_fn, init_position,
+            _, _, accept_rate, final_state = rahmc_run(
+                subkey, log_prob_fn, current_position,
                 step_size=float(jnp.exp(log_step_size)), num_steps=num_steps,
                 gamma=float(gamma), steepness=float(steepness),
                 num_samples=n_samples_per_tune, burn_in=0,
                 friction_schedule=friction_schedule,
                 inv_mass_matrix=inv_mass_matrix
             )
+            current_position = final_state.position  # Evolve chain
             alpha = float(jnp.mean(accept_rate))
 
             eta_m = 1.0 / (m + t0)
@@ -469,24 +473,27 @@ def coordinate_wise_tune_grahmc(
         # ===== 2. Tune gamma (hold step_size, steepness fixed) =====
         log_gamma = jnp.log(gamma)
         mu_gamma = log_gamma
-        log_gamma_bar = 0.0
+        log_gamma_bar = log_gamma  # Initialize to current value, not 0.0
         H_bar_gamma = 0.0
 
         for m in range(1, max_iter_per_param + 1):
             key, subkey = random.split(key)
-            _, _, accept_rate, _ = rahmc_run(
-                subkey, log_prob_fn, init_position,
+            _, _, accept_rate, final_state = rahmc_run(
+                subkey, log_prob_fn, current_position,
                 step_size=float(step_size), num_steps=num_steps,
                 gamma=float(jnp.exp(log_gamma)), steepness=float(steepness),
                 num_samples=n_samples_per_tune, burn_in=0,
                 friction_schedule=friction_schedule,
                 inv_mass_matrix=inv_mass_matrix
             )
+            current_position = final_state.position  # Evolve chain
             alpha = float(jnp.mean(accept_rate))
 
             eta_m = 1.0 / (m + t0)
             H_bar_gamma = (1 - eta_m) * H_bar_gamma + eta_m * (target_accept - alpha)
             log_gamma = mu_gamma - (jnp.sqrt(m) / gamma_da) * H_bar_gamma
+            # Clip to prevent explosion: gamma in [0.01, 50.0]
+            log_gamma = jnp.clip(log_gamma, jnp.log(0.01), jnp.log(50.0))
             m_kappa = m ** (-kappa)
             log_gamma_bar = m_kappa * log_gamma + (1 - m_kappa) * log_gamma_bar
 
@@ -496,24 +503,27 @@ def coordinate_wise_tune_grahmc(
         if has_steepness:
             log_steepness = jnp.log(steepness)
             mu_steepness = log_steepness
-            log_steepness_bar = 0.0
+            log_steepness_bar = log_steepness  # Initialize to current value, not 0.0
             H_bar_steepness = 0.0
 
             for m in range(1, max_iter_per_param + 1):
                 key, subkey = random.split(key)
-                _, _, accept_rate, _ = rahmc_run(
-                    subkey, log_prob_fn, init_position,
+                _, _, accept_rate, final_state = rahmc_run(
+                    subkey, log_prob_fn, current_position,
                     step_size=float(step_size), num_steps=num_steps,
                     gamma=float(gamma), steepness=float(jnp.exp(log_steepness)),
                     num_samples=n_samples_per_tune, burn_in=0,
                     friction_schedule=friction_schedule,
                     inv_mass_matrix=inv_mass_matrix
                 )
+                current_position = final_state.position  # Evolve chain
                 alpha = float(jnp.mean(accept_rate))
 
                 eta_m = 1.0 / (m + t0)
                 H_bar_steepness = (1 - eta_m) * H_bar_steepness + eta_m * (target_accept - alpha)
                 log_steepness = mu_steepness - (jnp.sqrt(m) / gamma_da) * H_bar_steepness
+                # Clip to prevent explosion: steepness in [0.1, 100.0]
+                log_steepness = jnp.clip(log_steepness, jnp.log(0.1), jnp.log(100.0))
                 m_kappa = m ** (-kappa)
                 log_steepness_bar = m_kappa * log_steepness + (1 - m_kappa) * log_steepness_bar
 
@@ -521,14 +531,15 @@ def coordinate_wise_tune_grahmc(
 
         # Get final acceptance rate for this cycle
         key, subkey = random.split(key)
-        _, _, accept_rate, _ = rahmc_run(
-            subkey, log_prob_fn, init_position,
+        _, _, accept_rate, final_state = rahmc_run(
+            subkey, log_prob_fn, current_position,
             step_size=float(step_size), num_steps=num_steps,
             gamma=float(gamma), steepness=float(steepness),
             num_samples=n_samples_per_tune, burn_in=0,
             friction_schedule=friction_schedule,
             inv_mass_matrix=inv_mass_matrix
         )
+        current_position = final_state.position  # Evolve chain
         final_accept = float(jnp.mean(accept_rate))
 
         cycle_history.append({

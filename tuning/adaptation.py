@@ -155,7 +155,7 @@ def run_adaptive_warmup(
 
             # Run Sampler for a batch of samples
             if sampler == "hmc":
-                _, _, accept_rate, final_state = hmc_run(
+                samples_batch, _, accept_rate, final_state = hmc_run(
                     subkey, target_log_prob, position,
                     step_size=float(current_step_size),
                     num_steps=num_steps,
@@ -200,13 +200,9 @@ def run_adaptive_warmup(
             # Update Welford (Mass Matrix) if in slow phase
             if phase == 'slow' and sampler in ["hmc", "nuts", "grahmc", "rahmc"]:
                 # Accumulate all samples from this batch
-                if 'samples_batch' in locals():
-                    # samples_batch shape: (num_samples, n_chains, n_dim)
-                    for sample in samples_batch:
-                        welford_state = welford_update_batch(welford_state, sample)
-                else:
-                    # For HMC without returned samples, just use final position
-                    welford_state = welford_update_batch(welford_state, position)
+                # samples_batch shape: (num_samples, n_chains, n_dim)
+                for sample in samples_batch:
+                    welford_state = welford_update_batch(welford_state, sample)
 
         # End of Window Actions
         if phase == 'slow':
