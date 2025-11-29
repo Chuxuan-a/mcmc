@@ -6,7 +6,7 @@ import numpy as np
 from typing import Tuple, Dict, Any, Optional
 import time
 
-from tuning.welford import welford_init, welford_update_batch, welford_covariance
+from tuning.welford import welford_init, welford_update, welford_update_batch, welford_covariance
 from tuning.dual_averaging import da_init, da_update, da_reset
 
 from samplers.HMC import hmc_init, hmc_run
@@ -135,7 +135,7 @@ def run_adaptive_warmup(
         print(f"  [{s:4d} - {e:4d}] {t}")
 
     # Run Windowed Adaptation
-    welford_state = None
+    welford_states_per_chain = None
 
     # If not learning mass matrix, keep identity throughout and skip Welford
     if not learn_mass_matrix:
@@ -145,8 +145,10 @@ def run_adaptive_warmup(
         window_len = end_idx - start_idx
 
         # Reset Welford at the start of a 'slow' window (only if learning mass matrix)
+        # Maintain separate Welford state for each chain
+        # Stan's approach - treats each chain as a separate sequence
         if phase == 'slow' and learn_mass_matrix:
-            welford_state = welford_init(n_dim)
+            welford_states_per_chain = [welford_init(n_dim) for _ in range(n_chains)]
 
         # OPTIMIZATION: Run sampler in batches instead of 1 step at a time
         num_batches = max(1, window_len // update_freq)
@@ -210,23 +212,49 @@ def run_adaptive_warmup(
             if phase == 'slow' and learn_mass_matrix and sampler in ["hmc", "nuts", "grahmc", "rahmc"]:
                 # Accumulate all samples from this batch
                 # samples_batch shape: (num_samples, n_chains, n_dim)
+                #
+                # BUG FIX (Option B - Stan's approach):
+                # Maintain separate Welford state for each chain, update each independently
+                # This uses all chains but properly accounts for within-chain correlation
                 for sample in samples_batch:
-                    welford_state = welford_update_batch(welford_state, sample)
+                    # sample shape: (n_chains, n_dim)
+                    for chain_idx in range(n_chains):
+                        welford_states_per_chain[chain_idx] = welford_update(
+                            welford_states_per_chain[chain_idx],
+                            sample[chain_idx]
+                        )
 
         # End of Window Actions
         if phase == 'slow':
             if learn_mass_matrix:
-                # 1. Estimate Variance
-                _, variance = welford_covariance(welford_state)
+                # 1. Estimate Variance (Stan's approach: compute per-chain, then average)
+                # BUG FIX (Option B): Average variances across chains to properly handle correlation
+                chain_variances = []
+                for chain_idx in range(n_chains):
+                    _, var = welford_covariance(welford_states_per_chain[chain_idx])
+                    chain_variances.append(var)
+
+                # Average variances across chains
+                variance = jnp.mean(jnp.stack(chain_variances), axis=0)
+
+                # Get sample count from first chain (all chains have same count)
+                n_samples = welford_states_per_chain[0].count
 
                 # 2. Regularize (Stan approach)
-                n_samples = welford_state.count
-                regularizer = 1e-3 * 5.0 / (n_samples + 5.0)
-                variance = variance * (n_samples / (n_samples + 5.0)) + regularizer
+                # BUG FIX: Shrink toward identity (1.0), not toward ~0
+                # Stan's formula: weighted average with prior on identity
+                # Prior weight = 5, sample weight = n_samples
+                shrinkage_weight = n_samples / (n_samples + 5.0)
+                prior_weight = 5.0 / (n_samples + 5.0)
+                variance = shrinkage_weight * variance + prior_weight * 1.0  # Shrink toward 1.0
+
+                # Add numerical stability floor (separate from shrinkage)
+                variance = jnp.maximum(variance, 1e-8)
 
                 # 3. Update Mass Matrix
                 inv_mass_matrix = variance
                 print(f"  Window finished. Updated Mass Matrix. Range: [{jnp.min(variance):.4f}, {jnp.max(variance):.4f}]")
+                print(f"    (n_samples_per_chain={n_samples:.0f}, n_chains={n_chains}, shrinkage={shrinkage_weight:.3f})")
 
                 # 4. Reset Dual Averaging only when mass matrix changes
                 # (geometry changed, so step size needs re-tuning from new baseline)
