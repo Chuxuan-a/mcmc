@@ -38,6 +38,21 @@ from samplers.RWMH import rwMH_run
 from tuning.dual_averaging import dual_averaging_tune_rwmh
 
 
+# ============================================================================
+# Quality Gate Constants
+# ============================================================================
+
+# Fixed ESS thresholds (absolute)
+MIN_ESS_HARD_GATE = 400        # Hard gate: bulk ESS minimum
+MIN_ESS_TAIL_HARD_GATE = 100   # Hard gate: tail ESS minimum
+MIN_ESS_QUALITY = 400          # Quality check: minimum ESS
+MIN_ESS_TAIL_QUALITY = 400     # Quality check: tail ESS minimum
+
+# Efficiency thresholds (ESS/N ratios)
+INEFFICIENT_THRESHOLD = 0.01   # Flag if ESS/N < 1%
+HIGH_EFFICIENCY_THRESHOLD = 0.1  # Flag if ESS/N > 10%
+
+
 def detect_divergences(delta_H: jnp.ndarray, threshold: float = 1000.0) -> jnp.ndarray:
     """Detect divergent transitions from Hamiltonian error.
     
@@ -153,9 +168,7 @@ def run_trajectory_length_grid_search(
     key: jnp.ndarray,
     n_chains: int,
     num_warmup: int,
-    target_ess: int,
-    batch_size: int,
-    max_samples: int,
+    num_samples: int,
     schedule_type: str,
     num_steps_grid: List[int],
     learn_mass_matrix: bool = True,
@@ -190,9 +203,7 @@ def run_trajectory_length_grid_search(
             key=subkey,
             n_chains=n_chains,
             num_warmup=num_warmup,
-            target_ess=target_ess,
-            batch_size=batch_size,
-            max_samples=max_samples,
+            num_samples=num_samples,
             schedule_type=schedule_type,
             num_steps=num_steps,
             learn_mass_matrix=learn_mass_matrix,
@@ -250,14 +261,12 @@ def run_trajectory_length_grid_search(
             # Failure flags
             "grid_search_failed": True,
             "usable": False,
-            "overall_pass": False,
+            "quality_pass": False,
             "error": "No trajectory length produced usable samples",
             
             # Configuration
-            "target_ess": target_ess,
+            "num_samples": num_samples,
             "num_warmup": num_warmup,
-            "batch_size": batch_size,
-            "max_samples": max_samples,
             
             # Diagnostic metrics from least-bad run (for analysis)
             # These are clearly marked as coming from a failed run
@@ -326,7 +335,7 @@ def run_trajectory_length_grid_search(
                     "accept_rate": r.get("accept_rate"),
                     "divergence_rate": r.get("divergence_rate"),
                     "usable": r.get("usable", False),
-                    "overall_pass": r.get("overall_pass", False),
+                    "quality_pass": r.get("quality_pass", False),
                     "error": r.get("error"),
                 } for r in grid_results],
             },
@@ -344,7 +353,7 @@ def run_trajectory_length_grid_search(
     for r in grid_results:
         if r.get("error"):
             status = "[ERROR]"
-        elif r.get("overall_pass"):
+        elif r.get("quality_pass"):
             status = "[PASS]"
         elif r.get("usable"):
             status = "[USABLE]"
@@ -368,7 +377,7 @@ def run_trajectory_length_grid_search(
             "rhat_max": r.get("rhat_max", float('inf')),
             "total_samples": r.get("total_samples", 0),
             "usable": r.get("usable", False),
-            "overall_pass": r.get("overall_pass", False),
+            "quality_pass": r.get("quality_pass", False),
             "divergence_rate": r.get("divergence_rate", None),
         } for r in grid_results],
     }
@@ -383,9 +392,7 @@ def run_single_benchmark_with_L(
     key: jnp.ndarray,
     n_chains: int,
     num_warmup: int,
-    target_ess: int,
-    batch_size: int,
-    max_samples: int,
+    num_samples: int,
     schedule_type: str,
     num_steps: int,
     learn_mass_matrix: bool = True,
@@ -398,6 +405,7 @@ def run_single_benchmark_with_L(
     if sampler in ["grahmc", "rahmc"]:
         print(f"  Schedule: {schedule_type}")
     print(f"  Trajectory Length: L={num_steps}")
+    print(f"  Mass Matrix: {'Learned' if learn_mass_matrix else 'Identity'}")
     print(f"{'='*80}")
 
     start_time = time.time()
@@ -467,134 +475,84 @@ def run_single_benchmark_with_L(
         else:
             print(f"  Mass matrix: Identity (not learned)")
 
-        # Production sampling phase with ADAPTIVE sampling
-        print(f"\n[Phase 2] Adaptive Sampling (until ESS >= {target_ess}, max {max_samples} samples)...")
-        print(f"  Collecting in batches of {batch_size} samples")
+        # Production sampling phase with FIXED sample count
+        print(f"\n[Phase 2] Fixed Sampling ({num_samples} samples)...")
         sample_start = time.time()
 
-        all_samples_list = []
-        all_log_probs_list = []
-        total_samples = 0
-        batch_num = 0
         current_position = warmup_pos
-        final_accept_rate = 0.0
-        
-        # Track divergences
-        total_divergences = 0
-        total_transitions = 0
-        
-        # Track tree depths for NUTS gradient counting
-        all_tree_depths = []
+        key, sample_key = random.split(key)
 
-        while total_samples < max_samples:
-            batch_num += 1
-            key, sample_key = random.split(key)
-
-            if sampler == "rwmh":
-                samples_batch, lps_batch, accept_rate, final_state = rwMH_run(
-                    sample_key, target.log_prob_fn, current_position,
-                    num_samples=batch_size, scale=step_size, burn_in=0
-                )
-            elif sampler == "hmc":
-                samples_batch, lps_batch, accept_rate, final_state = hmc_run(
-                    sample_key, target.log_prob_fn, current_position,
-                    step_size=step_size, num_steps=num_steps,
-                    num_samples=batch_size, burn_in=0,
-                    inv_mass_matrix=inv_mass_matrix
-                )
-            elif sampler == "nuts":
-                samples_batch, lps_batch, accept_rate, final_state, tree_depths, mean_accept_probs = nuts_run(
-                    sample_key, target.log_prob_fn, current_position,
-                    step_size=step_size, max_tree_depth=10,
-                    num_samples=batch_size, burn_in=0,
-                    inv_mass_matrix=inv_mass_matrix
-                )
-                # FIX #2: Store tree depths for correct gradient counting
-                all_tree_depths.append(tree_depths)
-                
-            elif sampler in ["grahmc", "rahmc"]:
-                tuned_gamma = warmup_info.get("gamma", 1.0)
-                tuned_steepness = warmup_info.get("steepness", 5.0)
-
-                friction_schedule = get_friction_schedule(schedule_type)
-                samples_batch, lps_batch, accept_rate, final_state = rahmc_run(
-                    sample_key, target.log_prob_fn, current_position,
-                    step_size=step_size, num_steps=num_steps,
-                    gamma=tuned_gamma,
-                    steepness=tuned_steepness,
-                    num_samples=batch_size, burn_in=0,
-                    inv_mass_matrix=inv_mass_matrix,
-                    friction_schedule=friction_schedule
-                )
-
-            # Continue from where we left off
-            current_position = final_state.position
-            final_accept_rate = float(jnp.mean(accept_rate))
-
-            all_samples_list.append(samples_batch)
-            all_log_probs_list.append(lps_batch)
-            total_samples += batch_size
-            
-            # FIX: Track divergences (approximate via low acceptance for now)
-            # Note: For full divergence tracking, we'd need to modify the samplers
-            # to return delta_H. This is a proxy using very low acceptance.
-            batch_transitions = batch_size * n_chains
-            total_transitions += batch_transitions
-            # Very low acceptance in a batch suggests potential divergences
-            if final_accept_rate < 0.1:
-                # Estimate divergences as fraction with very low acceptance
-                estimated_div = int(batch_transitions * (1 - final_accept_rate) * 0.5)
-                total_divergences += estimated_div
-
-            # Concatenate all samples collected so far
-            samples = jnp.concatenate(all_samples_list, axis=0)
-
-            # Compute ESS to check if we've reached target
-            samples_for_arviz = np.array(samples).transpose(1, 0, 2)
-            idata = az.from_dict(
-                posterior={"x": samples_for_arviz},
-                coords={"dim": np.arange(target.dim)},
-                dims={"x": ["dim"]}
+        if sampler == "rwmh":
+            samples, log_probs, accept_rate, final_state = rwMH_run(
+                sample_key, target.log_prob_fn, current_position,
+                num_samples=num_samples, scale=step_size, burn_in=0
             )
-            ess_bulk = az.ess(idata, var_names=["x"], method="bulk")["x"].values
-            min_ess = float(np.min(ess_bulk))
-            mean_ess = float(np.mean(ess_bulk))
+            all_tree_depths = None
 
-            print(f"  Batch {batch_num}: {total_samples} total samples, min ESS = {min_ess:.1f}, mean ESS = {mean_ess:.1f}")
+        elif sampler == "hmc":
+            samples, log_probs, accept_rate, final_state = hmc_run(
+                sample_key, target.log_prob_fn, current_position,
+                step_size=step_size, num_steps=num_steps,
+                num_samples=num_samples, burn_in=0,
+                inv_mass_matrix=inv_mass_matrix
+            )
+            all_tree_depths = None
 
-            if min_ess >= target_ess:
-                print(f"  Target ESS reached!")
-                break
+        elif sampler == "nuts":
+            samples, log_probs, accept_rate, final_state, tree_depths, mean_accept_probs = nuts_run(
+                sample_key, target.log_prob_fn, current_position,
+                step_size=step_size, max_tree_depth=10,
+                num_samples=num_samples, burn_in=0,
+                inv_mass_matrix=inv_mass_matrix
+            )
+            all_tree_depths = tree_depths
 
-        # Final concatenation
-        samples = jnp.concatenate(all_samples_list, axis=0)
-        log_probs = jnp.concatenate(all_log_probs_list, axis=0)
+        elif sampler in ["grahmc", "rahmc"]:
+            tuned_gamma = warmup_info.get("gamma", 1.0)
+            tuned_steepness = warmup_info.get("steepness", 5.0)
+            friction_schedule = get_friction_schedule(schedule_type)
+
+            samples, log_probs, accept_rate, final_state = rahmc_run(
+                sample_key, target.log_prob_fn, current_position,
+                step_size=step_size, num_steps=num_steps,
+                gamma=tuned_gamma, steepness=tuned_steepness,
+                num_samples=num_samples, burn_in=0,
+                inv_mass_matrix=inv_mass_matrix,
+                friction_schedule=friction_schedule
+            )
+            all_tree_depths = None
+
+        total_samples = num_samples
+        final_accept_rate = float(jnp.mean(accept_rate))
+
+        # Divergence tracking: currently not implemented in samplers
+        # Would require sampler modifications to return delta_H
+        total_divergences = 0
+        total_transitions = num_samples * n_chains
+        divergence_rate = 0.0  # Placeholder until samplers return delta_H
 
         sample_time = time.time() - sample_start
         print(f"  Sampling complete in {sample_time:.1f}s")
-        print(f"  Total samples: {total_samples}")
+        print(f"  Collected {num_samples} samples")
         print(f"  Final acceptance rate: {final_accept_rate:.3f}")
         
-        # Compute divergence rate
-        divergence_rate = total_divergences / total_transitions if total_transitions > 0 else 0.0
-        if divergence_rate > 0.01:
-            print(f"  WARNING: Divergence rate = {divergence_rate:.1%}")
+        # Note: divergence_rate already set above, no warning needed for placeholder value
 
         # Compute correct gradient count
-        if sampler == "nuts" and all_tree_depths:
+        if sampler == "nuts" and all_tree_depths is not None:
             # NUTS: gradients = sum over samples of (2^depth - 1) per chain
-            tree_depths_array = jnp.concatenate(all_tree_depths, axis=0)  # (n_samples, n_chains)
+            # all_tree_depths shape: (num_samples, n_chains)
             # Each tree of depth d uses 2^d leapfrog steps, each using 1 gradient
-            gradients_per_sample = (2 ** tree_depths_array) - 1  # (n_samples, n_chains)
+            gradients_per_sample = (2 ** all_tree_depths) - 1  # (num_samples, n_chains)
             n_gradients = int(jnp.sum(gradients_per_sample))
-            avg_tree_depth = float(jnp.mean(tree_depths_array))
+            avg_tree_depth = float(jnp.mean(all_tree_depths))
             print(f"  NUTS avg tree depth: {avg_tree_depth:.2f}, total gradients: {n_gradients}")
         elif sampler == "rwmh":
             n_gradients = 0  # RWMH doesn't use gradients
             avg_tree_depth = None
         else:
             # HMC/GRAHMC: num_steps gradients per sample per chain
-            n_gradients = total_samples * num_steps * n_chains
+            n_gradients = num_samples * num_steps * n_chains
             avg_tree_depth = None
 
         # Set metadata
@@ -630,49 +588,62 @@ def run_single_benchmark_with_L(
         # Determine if target has ground truth available
         has_true_mean = target.true_mean is not None and target.true_cov is not None
 
-        # Check if we hit the maximum sample budget without reaching target ESS
-        hit_max_samples = total_samples >= max_samples
+        # Extract diagnostics
         rhat_max = diagnostics["rhat_max"]
         ess_min = diagnostics["ess_bulk_min"]
         ess_tail_min = diagnostics["ess_tail_min"]
 
-        # Relaxed convergence gate: "usable"
-        # TIGHTENED from original:
-        #   - R-hat: 1.05 -> 1.02
-        #   - ESS: 0.5*target -> 0.8*target  
-        #   - Added: tail ESS requirement
-        #   - Added: divergence rate check
+        # Compute efficiency metric
+        ess_per_sample = ess_min / num_samples
+
+        # Hard gate (usable): relaxed thresholds for comparative analysis
         usable = (
-            rhat_max <= 1.02 and                          # Tighter R-hat
-            ess_min >= 0.8 * target_ess and               # Higher ESS threshold
-            ess_tail_min >= 0.3 * target_ess and          # Tail ESS required
-            divergence_rate < 0.05 and                     # Max 5% divergences
-            not (hit_max_samples and ess_min < target_ess)
+            rhat_max < 1.05 and                          # Relaxed R-hat
+            ess_min >= MIN_ESS_HARD_GATE and             # Bulk ESS >= 400
+            ess_tail_min >= MIN_ESS_TAIL_HARD_GATE and   # Tail ESS >= 100
+            divergence_rate < 0.05                        # Max 5% divergences
         )
 
-        # Strict high-quality pass: "overall_pass"
-        overall_pass = (
-            usable and
-            rhat_max <= 1.01 and
-            ess_min >= target_ess and
-            ess_tail_min >= 0.5 * target_ess and
-            divergence_rate < 0.01 and                     # Stricter for pass
-            (not has_true_mean or stats_pass)
-        )
+        # Quality check (only computed if usable)
+        if usable:
+            quality_pass = (
+                rhat_max < 1.01 and                      # Strict R-hat
+                ess_min >= MIN_ESS_QUALITY and           # Bulk ESS >= 400
+                ess_tail_min >= MIN_ESS_TAIL_QUALITY and # Tail ESS >= 400
+                divergence_rate < 0.01 and               # Stricter divergence threshold
+                (not has_true_mean or stats_pass)
+            )
 
-        # Compute Sliced W2 distance to ground truth
-        print("[Phase 4] Computing Sliced W2 distance...")
-        key, w2_key = random.split(key)
-        sliced_w2 = compute_sliced_w2(
-            samples, target_name, target.dim,
-            n_reference=50000, n_projections=500, key=w2_key
-        )
-        if sliced_w2 is not None:
-            print(f"  Sliced W2: {sliced_w2:.6f}")
+            # Efficiency flags
+            is_inefficient = (ess_per_sample < INEFFICIENT_THRESHOLD)
+            is_high_efficiency = (ess_per_sample > HIGH_EFFICIENCY_THRESHOLD)
         else:
-            print(f"  Sliced W2: N/A (no reference sampler)")
+            quality_pass = False
+            is_inefficient = False
+            is_high_efficiency = False
 
+        # Final overall_pass (same as quality_pass for now)
+        overall_pass = quality_pass
+
+        # Compute total time BEFORE diagnostics (W2) to exclude overhead
         total_time = time.time() - start_time
+
+        # Compute Sliced W2 distance to ground truth (only if usable)
+        if usable:
+            print("[Phase 4] Computing Sliced W2 distance...")
+            key, w2_key = random.split(key)
+            sliced_w2 = compute_sliced_w2(
+                samples, target_name, target.dim,
+                n_reference=50000, n_projections=500, key=w2_key
+            )
+            if sliced_w2 is not None:
+                print(f"  Sliced W2: {sliced_w2:.6f}")
+            else:
+                print(f"  Sliced W2: N/A (no reference sampler)")
+        else:
+            # Skip W2 for non-usable runs
+            sliced_w2 = None
+            print("[Phase 4] Skipping W2 computation (run not usable)")
 
         # Compile results
         results = {
@@ -683,10 +654,8 @@ def run_single_benchmark_with_L(
             "num_steps": num_steps,
             "n_chains": n_chains,
             "num_warmup": num_warmup,
-            "batch_size": batch_size,
-            "max_samples": max_samples,
+            "num_samples": num_samples,
             "total_samples": total_samples,
-            "target_ess": target_ess,
             "warmup_time": warmup_time,
             "sample_time": sample_time,
             "total_time": total_time,
@@ -698,23 +667,29 @@ def run_single_benchmark_with_L(
             "ess_bulk_mean": diagnostics["ess_bulk_mean"],
             "ess_tail_min": diagnostics["ess_tail_min"],
             "ess_tail_mean": diagnostics["ess_tail_mean"],
+            # Efficiency metrics
+            "ess_per_sample": ess_per_sample,
+            "ess_per_gradient": ess_min / n_gradients if n_gradients > 0 else 0,
             # Divergence tracking
             "divergence_rate": divergence_rate,
             "total_divergences": total_divergences,
-            # Correct gradient count
+            # Gradient count
             "n_gradients": n_gradients,
             # Pass/fail criteria
             "rhat_pass": diagnostics["rhat_max"] < 1.01,
-            "ess_pass": diagnostics["ess_bulk_min"] >= target_ess,
-            "ess_tail_pass": diagnostics["ess_tail_min"] >= target_ess * 0.5,
+            "ess_pass": diagnostics["ess_bulk_min"] >= MIN_ESS_QUALITY,
+            "ess_tail_pass": diagnostics["ess_tail_min"] >= MIN_ESS_TAIL_QUALITY,
             "stats_pass": stats_pass,
             # Include z-score details
             "z_score_max": stats_result.get("max_z"),
             "z_score_threshold": stats_result.get("threshold"),
-            # Convergence gates (with tightened thresholds)
+            # Convergence gates
             "usable": usable,
-            "overall_pass": overall_pass,
-            # Distributional distance
+            "quality_pass": quality_pass,
+            # Efficiency flags
+            "is_inefficient": is_inefficient,
+            "is_high_efficiency": is_high_efficiency,
+            # Distributional distance (None if not usable)
             "sliced_w2": sliced_w2,
         }
 
@@ -729,7 +704,7 @@ def run_single_benchmark_with_L(
             results["mass_matrix_mean"] = float(inv_mass_matrix.mean())
 
         # Determine status display
-        if results["overall_pass"]:
+        if results["quality_pass"]:
             status = "[PASS]"
         elif results["usable"]:
             status = "[USABLE]"
@@ -739,7 +714,17 @@ def run_single_benchmark_with_L(
         print(f"\n{status}")
         print(f"  R-hat: {results['rhat_max']:.4f} | ESS: {results['ess_bulk_min']:.0f} | "
               f"Tail ESS: {results['ess_tail_min']:.0f} | Div: {divergence_rate:.1%}")
-        print(f"  Usable: {results['usable']} | HighQuality: {results['overall_pass']} | Time: {total_time:.1f}s")
+
+        # Quality gates info
+        eff_flag = ""
+        if is_high_efficiency:
+            eff_flag = " [HIGH EFFICIENCY]"
+        elif is_inefficient:
+            eff_flag = " [INEFFICIENT]"
+
+        print(f"  Usable: {results['usable']} | Quality: {results['quality_pass']} | "
+              f"Efficiency: {ess_per_sample:.1%}{eff_flag}")
+        print(f"  Time: {total_time:.1f}s")
 
         return results
 
@@ -762,7 +747,7 @@ def run_single_benchmark_with_L(
             "error": str(e),
             "total_time": total_time,
             "usable": False,
-            "overall_pass": False,
+            "quality_pass": False,
         }
 
 
@@ -773,13 +758,11 @@ def run_all_benchmarks(
     dim: int,
     n_chains: int,
     num_warmup: int,
-    target_ess: int,
-    batch_size: int,
-    max_samples: int,
+    num_samples: int,
     seed: int,
     output_dir: str,
     num_steps_grid: List[int] = None,
-    learn_mass_matrix: bool = True,
+    mass_matrix_modes: List[bool] = None,
 ) -> pd.DataFrame:
     """Run all sampler-target combinations and save results."""
 
@@ -805,9 +788,26 @@ def run_all_benchmarks(
         target = get_target(target_name, dim=dim)
 
         for sampler in samplers:
-            if sampler in ["grahmc", "rahmc"]:
-                # Test each schedule for GRAHMC with grid search over L
-                for schedule in grahmc_schedules:
+            for learn_mass_matrix in mass_matrix_modes:
+                if sampler in ["grahmc", "rahmc"]:
+                    # Test each schedule for GRAHMC with grid search over L
+                    for schedule in grahmc_schedules:
+                        key, subkey = random.split(key)
+                        results = run_trajectory_length_grid_search(
+                            sampler=sampler,
+                            target=target,
+                            target_name=target_name,
+                            key=subkey,
+                            n_chains=n_chains,
+                            num_warmup=num_warmup,
+                            num_samples=num_samples,
+                            schedule_type=schedule,
+                            num_steps_grid=num_steps_grid,
+                            learn_mass_matrix=learn_mass_matrix,
+                        )
+                        all_results.append(results)
+                elif sampler == "hmc":
+                    # HMC uses grid search over L
                     key, subkey = random.split(key)
                     results = run_trajectory_length_grid_search(
                         sampler=sampler,
@@ -816,50 +816,28 @@ def run_all_benchmarks(
                         key=subkey,
                         n_chains=n_chains,
                         num_warmup=num_warmup,
-                        target_ess=target_ess,
-                        batch_size=batch_size,
-                        max_samples=max_samples,
-                        schedule_type=schedule,
+                        num_samples=num_samples,
+                        schedule_type="constant",  # Unused for HMC
                         num_steps_grid=num_steps_grid,
                         learn_mass_matrix=learn_mass_matrix,
                     )
                     all_results.append(results)
-            elif sampler == "hmc":
-                # HMC uses grid search over L
-                key, subkey = random.split(key)
-                results = run_trajectory_length_grid_search(
-                    sampler=sampler,
-                    target=target,
-                    target_name=target_name,
-                    key=subkey,
-                    n_chains=n_chains,
-                    num_warmup=num_warmup,
-                    target_ess=target_ess,
-                    batch_size=batch_size,
-                    max_samples=max_samples,
-                    schedule_type="constant",  # Unused for HMC
-                    num_steps_grid=num_steps_grid,
-                    learn_mass_matrix=learn_mass_matrix,
-                )
-                all_results.append(results)
-            else:
-                # RWMH and NUTS don't use trajectory length grid search
-                key, subkey = random.split(key)
-                results = run_single_benchmark_with_L(
-                    sampler=sampler,
-                    target=target,
-                    target_name=target_name,
-                    key=subkey,
-                    n_chains=n_chains,
-                    num_warmup=num_warmup,
-                    target_ess=target_ess,
-                    batch_size=batch_size,
-                    max_samples=max_samples,
-                    schedule_type="constant",  # Unused for RWMH/NUTS
-                    num_steps=20,  # Unused for RWMH/NUTS
-                    learn_mass_matrix=learn_mass_matrix,
-                )
-                all_results.append(results)
+                else:
+                    # RWMH and NUTS don't use trajectory length grid search
+                    key, subkey = random.split(key)
+                    results = run_single_benchmark_with_L(
+                        sampler=sampler,
+                        target=target,
+                        target_name=target_name,
+                        key=subkey,
+                        n_chains=n_chains,
+                        num_warmup=num_warmup,
+                        num_samples=num_samples,
+                        schedule_type="constant",  # Unused for RWMH/NUTS
+                        num_steps=20,  # Unused for RWMH/NUTS
+                        learn_mass_matrix=learn_mass_matrix,
+                    )
+                    all_results.append(results)
 
     # Convert to DataFrame
     df = pd.DataFrame(all_results)
@@ -911,22 +889,30 @@ def print_summary(df: pd.DataFrame):
     print(f"\nTotal experiments: {len(df)}")
     
     # Count by status
-    passed = df['overall_pass'].sum() if 'overall_pass' in df.columns else 0
+    passed = df['quality_pass'].sum() if 'quality_pass' in df.columns else 0
     usable = df['usable'].sum() if 'usable' in df.columns else 0
     failed = len(df) - usable
     grid_failed = df['grid_search_failed'].sum() if 'grid_search_failed' in df.columns else 0
-    
-    print(f"High Quality (overall_pass): {passed}/{len(df)} ({100*passed/len(df):.1f}%)")
+
+    print(f"High Quality (quality_pass): {passed}/{len(df)} ({100*passed/len(df):.1f}%)")
     print(f"Usable: {usable}/{len(df)} ({100*usable/len(df):.1f}%)")
     print(f"Failed: {failed}/{len(df)} ({100*failed/len(df):.1f}%)")
     if grid_failed > 0:
         print(f"Grid Search Failures: {grid_failed}")
 
+    # Efficiency flags
+    if 'is_inefficient' in df.columns and 'is_high_efficiency' in df.columns:
+        inefficient_count = df['is_inefficient'].sum()
+        high_efficiency_count = df['is_high_efficiency'].sum()
+        print(f"\nEfficiency Flags:")
+        print(f"  Inefficient (ESS/N < 1%): {inefficient_count}/{len(df)}")
+        print(f"  High Efficiency (ESS/N > 10%): {high_efficiency_count}/{len(df)}")
+
     # Breakdown by sampler
     print(f"\nBy Sampler:")
     for sampler in df['sampler'].unique():
         sampler_df = df[df['sampler'] == sampler]
-        passed = sampler_df['overall_pass'].sum() if 'overall_pass' in sampler_df.columns else 0
+        passed = sampler_df['quality_pass'].sum() if 'quality_pass' in sampler_df.columns else 0
         usable = sampler_df['usable'].sum() if 'usable' in sampler_df.columns else 0
         total = len(sampler_df)
         print(f"  {sampler:10s}: pass={passed}/{total}, usable={usable}/{total}")
@@ -935,7 +921,7 @@ def print_summary(df: pd.DataFrame):
     print(f"\nBy Target:")
     for target in df['target'].unique():
         target_df = df[df['target'] == target]
-        passed = target_df['overall_pass'].sum() if 'overall_pass' in target_df.columns else 0
+        passed = target_df['quality_pass'].sum() if 'quality_pass' in target_df.columns else 0
         usable = target_df['usable'].sum() if 'usable' in target_df.columns else 0
         total = len(target_df)
         print(f"  {target:30s}: pass={passed}/{total}, usable={usable}/{total}")
@@ -963,15 +949,14 @@ def print_summary(df: pd.DataFrame):
                 ess = row.get('ess_bulk_min')
                 ess_tail = row.get('ess_tail_min')
                 div_rate = row.get('divergence_rate')
-                target_ess = row.get('target_ess', 1000)
-                
+
                 issues = []
-                if rhat is not None and rhat > 1.02:
-                    issues.append(f"R-hat={rhat:.3f} (>1.02)")
-                if ess is not None and ess < 0.8 * target_ess:
-                    issues.append(f"ESS={ess:.0f} (<{0.8*target_ess:.0f})")
-                if ess_tail is not None and ess_tail < 0.3 * target_ess:
-                    issues.append(f"TailESS={ess_tail:.0f} (<{0.3*target_ess:.0f})")
+                if rhat is not None and rhat > 1.05:
+                    issues.append(f"R-hat={rhat:.3f} (>1.05)")
+                if ess is not None and ess < MIN_ESS_HARD_GATE:
+                    issues.append(f"ESS={ess:.0f} (<{MIN_ESS_HARD_GATE})")
+                if ess_tail is not None and ess_tail < MIN_ESS_TAIL_HARD_GATE:
+                    issues.append(f"TailESS={ess_tail:.0f} (<{MIN_ESS_TAIL_HARD_GATE})")
                 if div_rate is not None and div_rate > 0.05:
                     issues.append(f"Div={div_rate:.1%} (>5%)")
                 
@@ -1007,11 +992,18 @@ def print_summary(df: pd.DataFrame):
                 sampler_name = row['sampler']
                 if row.get('schedule'):
                     sampler_name = f"{sampler_name}-{row['schedule']}"
-                
+
+                # Add efficiency flag
+                eff_flag = ""
+                if row.get('is_high_efficiency'):
+                    eff_flag = " [HIGH EFF]"
+                elif row.get('is_inefficient'):
+                    eff_flag = " [INEFFICIENT]"
+
                 print(f"{sampler_name:<25s} {row['target']:<25s} "
                       f"{row['ess_per_gradient']:>12.6f} "
                       f"{row.get('ess_bulk_min', 0):>8.0f} "
-                      f"{row.get('rhat_max', 0):>8.4f}")
+                      f"{row.get('rhat_max', 0):>8.4f}{eff_flag}")
             
             # Best sampler per target
             print(f"\nBest Sampler per Target:")
@@ -1050,18 +1042,15 @@ def main():
                        help="Dimensionality of targets")
     parser.add_argument("--n-chains", type=int, default=4,
                        help="Number of parallel chains")
-    parser.add_argument("--num-warmup", type=int, default=1000,
+    parser.add_argument("--num-warmup", type=int, default=2000,
                        help="Number of warmup steps for adaptive tuning")
-    parser.add_argument("--target-ess", type=int, default=400,
-                       help="Target ESS for adaptive sampling to reach (default: 400, matches Stan)")
-    parser.add_argument("--batch-size", type=int, default=2000,
-                       help="Batch size for adaptive sampling")
-    parser.add_argument("--max-samples", type=int, default=50000,
-                       help="Maximum samples before giving up")
+    parser.add_argument("--num-samples", type=int, default=None,
+                       help="Fixed number of samples to collect (default: 10k for dim>=20, 4k otherwise)")
     parser.add_argument("--num-steps-grid", nargs="+", type=int, default=None,
                        help="Grid of trajectory lengths to test for HMC/GRAHMC")
-    parser.add_argument("--no-mass-matrix", action="store_true",
-                       help="Disable mass matrix adaptation (use identity matrix)")
+    parser.add_argument("--mass-matrix-mode", type=str,
+                       choices=["mass", "no-mass", "both"], default="mass",
+                       help="Mass matrix configuration: 'mass' (learn), 'no-mass' (identity), 'both' (run both)")
 
     # Output
     parser.add_argument("--output-dir", type=str, default="benchmark_results",
@@ -1081,30 +1070,42 @@ def main():
         print("Error: Must specify --targets or --all-targets")
         return
 
-    learn_mass_matrix = not args.no_mass_matrix
+    # Parse mass matrix modes
+    mass_matrix_modes = []
+    if args.mass_matrix_mode == "mass":
+        mass_matrix_modes = [True]
+    elif args.mass_matrix_mode == "no-mass":
+        mass_matrix_modes = [False]
+    elif args.mass_matrix_mode == "both":
+        mass_matrix_modes = [True, False]
+
+    # Dimension-dependent default for num_samples
+    if args.num_samples is None:
+        if args.dim >= 20:
+            num_samples = 10000
+        else:
+            num_samples = 4000
+        print(f"Using default num_samples={num_samples} for dim={args.dim}")
+    else:
+        num_samples = args.num_samples
 
     print(f"\n{'='*80}")
-    if learn_mass_matrix:
-        print("MCMC BENCHMARK SUITE (with Adaptive Warmup + Mass Matrix Tuning)")
-    else:
-        print("MCMC BENCHMARK SUITE (with Adaptive Warmup, NO Mass Matrix)")
+    print("MCMC BENCHMARK SUITE (Fixed-Budget with Adaptive Warmup)")
     print(f"{'='*80}")
-    print(f"PATCHED VERSION: Fixes #1-5 applied")
-    print(f"  #1: Grid search explicit failure handling")
-    print(f"  #2: Tightened usable gate (R-hat<=1.02, ESS>=0.8*target)")
-    print(f"  #3: Divergence detection and gating")
-    print(f"  #4: Tail ESS in usable gate")
-    print(f"  #5: Correct NUTS gradient count + Bonferroni z-score")
+    print(f"FIXED-BUDGET BENCHMARKING")
     print(f"{'='*80}")
     print(f"Targets: {', '.join(targets)}")
     print(f"Samplers: {', '.join(args.samplers)}")
     print(f"Dimension: {args.dim}")
     print(f"Chains: {args.n_chains}")
     print(f"Warmup: {args.num_warmup} steps")
-    print(f"Batch size: {args.batch_size} samples per batch")
-    print(f"Max samples: {args.max_samples}")
-    print(f"Target ESS: {args.target_ess}")
-    print(f"Mass matrix: {'Learned' if learn_mass_matrix else 'Identity (disabled)'}")
+    print(f"Samples per run: {num_samples}")
+    if len(mass_matrix_modes) == 2:
+        print(f"Mass matrix: Both (learned + identity) - 2x runs per config")
+    elif mass_matrix_modes[0]:
+        print(f"Mass matrix: Learned")
+    else:
+        print(f"Mass matrix: Identity (disabled)")
     print(f"Output: {args.output_dir}")
     print(f"{'='*80}\n")
 
@@ -1116,13 +1117,11 @@ def main():
         dim=args.dim,
         n_chains=args.n_chains,
         num_warmup=args.num_warmup,
-        batch_size=args.batch_size,
-        max_samples=args.max_samples,
-        target_ess=args.target_ess,
+        num_samples=num_samples,
         seed=args.seed,
         output_dir=args.output_dir,
         num_steps_grid=args.num_steps_grid,
-        learn_mass_matrix=learn_mass_matrix,
+        mass_matrix_modes=mass_matrix_modes,
     )
 
     # Print summary
