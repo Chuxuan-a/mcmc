@@ -493,13 +493,20 @@ def get_target(name: str, dim: int = 10, **kwargs) -> TargetDistribution:
     Args:
         name: One of ['standard_normal', 'correlated_gaussian',
                       'ill_conditioned_gaussian', 'student_t', 'log_gamma',
-                      'rosenbrock', 'neals_funnel', 'gaussian_mixture']
+                      'rosenbrock', 'neals_funnel', 'gaussian_mixture',
+                      'multimodal_funnel_2d', 'concentric_l1_2d', 'concentric_l1_3d',
+                      'nested_l1_2d', 'nested_l1_3d']
         dim: Dimensionality for the target.
         **kwargs: Additional arguments passed to target factory.
 
     Returns:
         TargetDistribution object.
     """
+    # Import RAHMC paper targets
+    from benchmarks.rahmc_paper_targets import (
+        multimodal_funnel_2d, concentric_l1_balls, nested_l1_balls
+    )
+
     targets = {
         'standard_normal': standard_normal,
         'correlated_gaussian': correlated_gaussian,
@@ -509,6 +516,12 @@ def get_target(name: str, dim: int = 10, **kwargs) -> TargetDistribution:
         'rosenbrock': rosenbrock,
         'neals_funnel': neals_funnel,
         'gaussian_mixture': gaussian_mixture,
+        # RAHMC paper targets (low-dimensional)
+        'multimodal_funnel_2d': lambda dim=2, **kw: multimodal_funnel_2d(mu=3.0, sigma=1.0, c=1.0),
+        'concentric_l1_2d': lambda dim=2, **kw: concentric_l1_balls(dim=2, radii=(4.0, 8.0, 16.0), sigma=0.5),
+        'concentric_l1_3d': lambda dim=3, **kw: concentric_l1_balls(dim=3, radii=(4.0, 8.0, 16.0), sigma=0.5),
+        'nested_l1_2d': lambda dim=2, **kw: nested_l1_balls(dim=2, r_outer=20.0, r_inner=2.0, mu_norm=2.0, sigma=0.5, n_inner=4),
+        'nested_l1_3d': lambda dim=3, **kw: nested_l1_balls(dim=3, r_outer=20.0, r_inner=2.0, mu_norm=2.0, sigma=0.5, n_inner=4),
     }
 
     if name not in targets:

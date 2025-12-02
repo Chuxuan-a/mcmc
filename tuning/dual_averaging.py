@@ -1,6 +1,7 @@
 """Dual averaging parameter tuning for MCMC samplers."""
 from typing import Tuple, Dict, NamedTuple, Optional, List
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import random
@@ -611,7 +612,7 @@ class JointDualAveragingState(NamedTuple):
     H_bar: float                 # Scalar: Acceptance error is still scalar
     mu: jnp.ndarray              # Vector: Reference point
     count: int
-    gamma: float = 0.05
+    omega: float = 0.05          # Decay rate (was 'gamma' - renamed to avoid confusion with GRAHMC friction)
     t0: float = 10.0
     kappa: float = 0.75
 
@@ -629,19 +630,19 @@ def joint_da_init(initial_params: jnp.ndarray) -> JointDualAveragingState:
 def joint_da_update(state: JointDualAveragingState, accept_stat: float, target_accept: float) -> JointDualAveragingState:
     """Update vector of parameters based on scalar acceptance error."""
     m = state.count + 1
-    
+
     # 1. Update Error Accumulator (H_bar)
     # Note: A low acceptance (accept < target) results in POSITIVE (target - accept).
     eta_m = 1.0 / (m + state.t0)
     H_bar = (1 - eta_m) * state.H_bar + eta_m * (target_accept - accept_stat)
-    
+
     # 2. Update Parameters
     # We subtract H_bar.
     # If acceptance is LOW -> H_bar is POSITIVE -> Params DECREASE.
     #   - Step size decreases (improves integration accuracy)
     #   - Gamma decreases (reduces energy drift)
     # This direction is correct for both parameters.
-    log_params = state.mu - (jnp.sqrt(m) / state.gamma) * H_bar
+    log_params = state.mu - (jnp.sqrt(m) / state.omega) * H_bar
 
     # Clip gamma to prevent extreme values (step_size left unconstrained)
     log_params = jnp.array([
@@ -659,7 +660,7 @@ def joint_da_update(state: JointDualAveragingState, accept_stat: float, target_a
         H_bar=float(H_bar),
         mu=state.mu,
         count=m,
-        gamma=state.gamma,
+        omega=state.omega,
         t0=state.t0,
         kappa=state.kappa
     )
@@ -768,7 +769,7 @@ class DualAveragingState(NamedTuple):
     H_bar: float          # Running average of (target - accept)
     mu: float             # Reference point
     count: int            # Iteration counter (m)
-    gamma: float = 0.05
+    omega: float = 0.05   # Decay rate (was 'gamma' - renamed to avoid confusion with GRAHMC friction)
     t0: float = 10.0
     kappa: float = 0.75
 
@@ -787,17 +788,17 @@ def da_init(initial_step_size: float) -> DualAveragingState:
 
 def da_update(state: DualAveragingState, accept_stat: float, target_accept: float) -> DualAveragingState:
     """Perform one step of dual averaging parameter update.
-    
+
     Returns updated state. To get the current step size, use exp(state.log_step).
     """
     m = state.count + 1
-    
+
     # Update H_bar
     eta_m = 1.0 / (m + state.t0)
     H_bar = (1 - eta_m) * state.H_bar + eta_m * (target_accept - accept_stat)
-    
+
     # Compute log_step
-    log_step = state.mu - (jnp.sqrt(m) / state.gamma) * H_bar
+    log_step = state.mu - (jnp.sqrt(m) / state.omega) * H_bar
     
     # Compute log_step_bar (smoothed)
     m_kappa = m ** (-state.kappa)
@@ -814,7 +815,7 @@ def da_update(state: DualAveragingState, accept_stat: float, target_accept: floa
         H_bar=float(H_bar),
         mu=state.mu,
         count=m,
-        gamma=state.gamma,
+        omega=state.omega,
         t0=state.t0,
         kappa=state.kappa
     )
@@ -839,7 +840,7 @@ def da_reset(state: DualAveragingState) -> DualAveragingState:
         H_bar=0.0,
         mu=current_step,  # Reset target to smoothed best guess
         count=0,
-        gamma=state.gamma,
+        omega=state.omega,
         t0=state.t0,
         kappa=state.kappa
     )
