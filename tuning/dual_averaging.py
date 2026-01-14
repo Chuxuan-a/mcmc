@@ -436,7 +436,7 @@ def dual_averaging_tune_nuts(
 #     d = init_position.shape[-1]
 #     step_size = 0.5 / jnp.sqrt(d)
 #     gamma = 1.0
-#     steepness = 5.0 if schedule_type == 'tanh' else (10.0 if schedule_type == 'sigmoid' else 1.0)
+#     steepness = 0.5 if schedule_type == 'tanh' else (2.0 if schedule_type == 'sigmoid' else 1.0)
 
 #     # Track history
 #     cycle_history = []
@@ -678,9 +678,50 @@ def joint_tune_grahmc(
     current_step_size: float = None, # Optional starting point
     fixed_steepness: float = 10.0,   # Fixed steepness value
 ) -> Tuple[float, float, float, Dict]:
-    """Jointly tune step_size and gamma for GRAHMC.
-    
-    Replaces coordinate-wise tuning. Steepness is fixed (not tuned).
+    """Jointly tune step_size and gamma for GRAHMC using dual averaging.
+
+    WARNING: This function is NOT currently used in the production pipeline.
+    It has been replaced by sequential_tune_grahmc() which uses ESJD-based
+    gamma search instead of acceptance-driven tuning.
+
+    WHY REPLACED:
+    Joint dual averaging assumes step_size and gamma move in the same direction
+    to improve acceptance rate. However:
+    - Acceptance ↓ when step_size ↑ (over-integration causes more rejections)
+    - Acceptance ↑ when gamma ↑ (friction helps stabilize integration)
+    These have OPPOSITE relationships, creating conflicting DA signals that
+    prevent proper convergence. ESJD (Expected Squared Jump Distance) is a
+    better metric for gamma tuning as it directly measures exploration quality.
+
+    WHEN TO USE THIS:
+    - Experimental comparison against sequential tuning approach
+    - Research into acceptance-driven friction adaptation
+    - Quick prototyping when ESJD computation is too expensive
+    - Theoretical studies of joint parameter optimization
+
+    CURRENT PRODUCTION APPROACH:
+    See sequential_tune_grahmc() in tuning/sequential_tune_grahmc.py which uses:
+    1. Phase 1: Tune step_size with conservative gamma=0.5 (dual averaging)
+    2. Phase 2: Tune gamma via ESJD coarse-to-fine grid search
+
+    NOTE: This function correctly accepts current_step_size from Phase 2 warmup,
+    unlike the original sequential_tune_grahmc which ignored it (fixed in Issue #2).
+
+    Args:
+        key: JAX random key
+        log_prob_fn: Target log probability function
+        grad_log_prob_fn: Gradient function (unused, for API compatibility)
+        init_position: Initial position (n_dim,) or (n_chains, n_dim)
+        num_steps: Number of leapfrog steps (L)
+        schedule_type: Friction schedule type
+        target_accept: Target acceptance rate
+        max_iter: Maximum DA iterations
+        inv_mass_matrix: Optional inverse mass matrix
+        current_step_size: Optional starting step_size (e.g., from Phase 2)
+        fixed_steepness: Fixed steepness value (not tuned)
+
+    Returns:
+        Tuple of (step_size, gamma, steepness, history_dict)
     """
     friction_schedule = get_friction_schedule(schedule_type)
     n_dim = init_position.shape[-1]
@@ -779,7 +820,7 @@ def da_init(initial_step_size: float) -> DualAveragingState:
     log_step = jnp.log(initial_step_size)
     return DualAveragingState(
         log_step=float(log_step),
-        log_step_bar=0.0,  # Will be initialized on first update
+        log_step_bar=float(log_step),  # Initialize to same as log_step
         H_bar=0.0,
         mu=float(log_step),
         count=0

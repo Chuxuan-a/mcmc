@@ -486,7 +486,7 @@ def rahmc_run(
 #     if friction_schedule is None:
 #         friction_schedule = constant_schedule
 #         gamma_max = 1.0
-#         steepness = 1.0
+#         steepness = 0.5
 
 #     steepness_val = steepness if steepness is not None else 5.0
 
