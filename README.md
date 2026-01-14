@@ -119,12 +119,11 @@ python analyze_benchmarks.py benchmark_results/ --L-all
 │   └── plots.py                # Diagnostic visualization
 ├── benchmarks/                  # Benchmarking infrastructure
 │   ├── targets.py              # Target distribution definitions
-│   ├── metrics.py              # Quality metrics and gates
-│   └── rahmc_paper_targets.py  # RAHMC paper comparison targets
+│   └── metrics.py              # Quality metrics and gates
 ├── analysis/                    # Results analysis utilities
 │   ├── utils.py                # Data loading and processing
 │   ├── grid_analysis.py        # L grid search analysis
-│   └── research_plots.py       # Publication-quality plots
+│   └── research_plots.py       # Visualization utilities
 ├── animations/                  # Sampler comparison visualizations
 ├── run_benchmarks.py           # Main benchmark runner
 ├── analyze_benchmarks.py       # Results analysis CLI
@@ -167,8 +166,6 @@ Generalized Repelling-Attracting HMC with time-varying friction. The friction co
 | `log_gamma` | Asymmetry | Heavy tails, positivity constraints |
 | `gaussian_mixture` | Multimodality | Bimodal in first dimension |
 
-Additional RAHMC paper targets available in `benchmarks/rahmc_paper_targets.py` for direct comparison with published results.
-
 ## Benchmarking System
 
 ### Fixed-Budget Approach
@@ -189,7 +186,7 @@ Results are filtered through two quality tiers:
 - ESS tail ≥ 100
 - Divergence rate < 5%
 
-**Quality Pass** - Publication-ready standard:
+**Quality Pass** - Strict standard:
 - R-hat < 1.01
 - ESS bulk ≥ 400
 - ESS tail ≥ 200
@@ -215,7 +212,7 @@ Based on Hoffman & Gelman (2014), automatically adjusts step size to achieve tar
 ### Mass Matrix Adaptation
 Stan-style windowed warmup with Welford's online algorithm:
 1. **Exploration phase** (500 steps): Initial step size tuning
-2. **Adaptation windows** (doubling: 25, 50, 100...): Learn diagonal mass matrix
+2. **Adaptation windows** (fixed: 25, 50, 100, 200, 500, 1000): Learn diagonal mass matrix
 3. **Cooldown phase** (125 steps): Final step size refinement
 
 Shrinkage regularization prevents extreme variance estimates.

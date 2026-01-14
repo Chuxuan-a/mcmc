@@ -118,8 +118,8 @@ rosenbrock_convergence/
 
 # Benchmark run outputs (FINAL*, analysis dirs)
 FINAL*/
-analysis/
 analysis_*/
+analysis/README.md
 
 # Generated plots and figures
 pub_plots/
