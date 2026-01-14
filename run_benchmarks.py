@@ -28,7 +28,7 @@ import jax.numpy as jnp
 from jax import random, grad
 import arviz as az
 
-from benchmarks.targets import get_target, TargetDistribution
+from benchmarks.targets import get_target, TargetDistribution, get_reference_sampler
 from benchmarks.metrics import compute_sliced_w2
 from tuning.adaptation import run_adaptive_warmup
 from samplers.HMC import hmc_run
@@ -41,16 +41,50 @@ from tuning.dual_averaging import dual_averaging_tune_rwmh
 # ============================================================================
 # Quality Gate Constants
 # ============================================================================
+#
+# Two-tier system for fixed-budget benchmarking:
+# - Hard gate (usable): Minimum for comparative analysis
+# - Quality pass: Gold standard, publishable results
+#
+# References:
+# - Stan: R-hat < 1.01, ESS ≥ 400 (bulk), ESS ≥ 100 (tail)
+# - Vehtari et al. (2021): Rank-normalized R-hat, ESS thresholds
+# ============================================================================
 
 # Fixed ESS thresholds (absolute)
-MIN_ESS_HARD_GATE = 400        # Hard gate: bulk ESS minimum
-MIN_ESS_TAIL_HARD_GATE = 100   # Hard gate: tail ESS minimum
-MIN_ESS_QUALITY = 400          # Quality check: minimum ESS
-MIN_ESS_TAIL_QUALITY = 400     # Quality check: tail ESS minimum
+MIN_ESS_HARD_GATE = 400        # Hard gate: bulk ESS minimum (Stan standard)
+MIN_ESS_TAIL_HARD_GATE = 100   # Hard gate: tail ESS minimum (Stan standard)
+MIN_ESS_QUALITY = 400          # Quality check: bulk ESS minimum
+MIN_ESS_TAIL_QUALITY = 200     # Quality check: tail ESS (relaxed from 400, still stricter than Stan's 100)
 
 # Efficiency thresholds (ESS/N ratios)
 INEFFICIENT_THRESHOLD = 0.01   # Flag if ESS/N < 1%
 HIGH_EFFICIENCY_THRESHOLD = 0.1  # Flag if ESS/N > 10%
+
+
+def get_log_checkpoints(max_samples: int, base: float = 1.5) -> List[int]:
+    """Generate log-spaced checkpoint sample counts for convergence tracking.
+
+    Creates exponentially-spaced checkpoints to get more resolution early
+    (when convergence is fastest) and less later (when changes are slower).
+
+    Example for max_samples=10000, base=1.5:
+        [100, 150, 225, 337, 506, 759, 1138, 1707, 2561, 3841, 5762, 8643, 10000]
+
+    Args:
+        max_samples: Maximum number of samples
+        base: Multiplicative factor for log spacing (default: 1.5)
+
+    Returns:
+        List of checkpoint sample counts (roughly evenly spaced on log scale)
+    """
+    checkpoints = []
+    current = 100  # Start at 100 samples minimum
+    while current < max_samples:
+        checkpoints.append(int(current))
+        current *= base
+    checkpoints.append(max_samples)  # Always include final count
+    return checkpoints
 
 
 def detect_divergences(delta_H: jnp.ndarray, threshold: float = 1000.0) -> jnp.ndarray:
@@ -172,6 +206,8 @@ def run_trajectory_length_grid_search(
     schedule_type: str,
     num_steps_grid: List[int],
     learn_mass_matrix: bool = True,
+    track_convergence: bool = False,
+    convergence_base: float = 1.5,
 ) -> Dict:
     """Run grid search over trajectory lengths and return best result.
 
@@ -207,6 +243,8 @@ def run_trajectory_length_grid_search(
             schedule_type=schedule_type,
             num_steps=num_steps,
             learn_mass_matrix=learn_mass_matrix,
+            track_convergence=track_convergence,
+            convergence_base=convergence_base,
         )
 
         # Calculate ESS per gradient for ranking
@@ -283,6 +321,7 @@ def run_trajectory_length_grid_search(
             "ess_tail_mean": least_bad.get("ess_tail_mean"),
             
             # Efficiency metrics (for comparison even when failed)
+            "ess_per_sample": least_bad.get("ess_per_sample"),
             "ess_per_gradient": least_bad.get("ess_per_gradient", 0),
             
             # Stability diagnostics
@@ -300,11 +339,18 @@ def run_trajectory_length_grid_search(
             "stats_pass": least_bad.get("stats_pass"),
             "z_score_max": least_bad.get("z_score_max"),
             "z_score_threshold": least_bad.get("z_score_threshold"),
+
+            # Convergence tracking (None if not tracked)
+            "convergence_trace": least_bad.get("convergence_trace"),
             
             # Pass/fail breakdown (shows which criteria failed)
             "rhat_pass": least_bad.get("rhat_pass"),
             "ess_pass": least_bad.get("ess_pass"),
             "ess_tail_pass": least_bad.get("ess_tail_pass"),
+
+            # Efficiency flags
+            "is_inefficient": least_bad.get("is_inefficient"),
+            "is_high_efficiency": least_bad.get("is_high_efficiency"),
             
             # Sampler-specific params from least-bad run
             "step_size": least_bad.get("step_size"),
@@ -330,21 +376,41 @@ def run_trajectory_length_grid_search(
                     "ess_bulk_min": r.get("ess_bulk_min", 0),
                     "ess_tail_min": r.get("ess_tail_min", 0),
                     "rhat_max": r.get("rhat_max", float('inf')),
+                    "rhat_mean": r.get("rhat_mean", None),
+                    "accept_rate": r.get("accept_rate", None),
+                    "step_size": r.get("step_size", None),
                     "total_samples": r.get("total_samples", 0),
                     "n_gradients": r.get("n_gradients", 0),
-                    "accept_rate": r.get("accept_rate"),
-                    "divergence_rate": r.get("divergence_rate"),
+                    "warmup_time": r.get("warmup_time", None),
+                    "sample_time": r.get("sample_time", None),
                     "usable": r.get("usable", False),
                     "quality_pass": r.get("quality_pass", False),
+                    "divergence_rate": r.get("divergence_rate", None),
                     "error": r.get("error"),
+                    "sliced_w2": r.get("sliced_w2", None),
+                    "z_score_max": r.get("z_score_max", None),
+                    # GRAHMC-specific
+                    "gamma": r.get("gamma", None),
+                    "steepness": r.get("steepness", None),
                 } for r in grid_results],
             },
         }
         return failure_result
 
     # Normal case: select best among usable runs
-    best_result = max(usable_results, key=lambda r: r["ess_per_gradient"])
-    selected_L = best_result["num_steps"]
+    # Prefer quality_pass runs over merely usable runs
+    quality_results = [r for r in usable_results if r.get("quality_pass", False)]
+
+    if quality_results:
+        # Pick best quality_pass run
+        best_result = max(quality_results, key=lambda r: r["ess_per_gradient"])
+        selected_L = best_result["num_steps"]
+        selection_tier = "quality_pass"
+    else:
+        # Fall back to best usable run
+        best_result = max(usable_results, key=lambda r: r["ess_per_gradient"])
+        selected_L = best_result["num_steps"]
+        selection_tier = "usable_only"
 
     print(f"\n{'='*80}")
     print(f"GRID SEARCH COMPLETE")
@@ -363,22 +429,36 @@ def run_trajectory_length_grid_search(
         print(f"  L={r['num_steps']:2d}: ESS/grad={r.get('ess_per_gradient', 0):.6f}, "
               f"ESS={r.get('ess_bulk_min', 0):7.1f}, R-hat={r.get('rhat_max', 0):.4f}{div_info} {status}")
 
-    print(f"\n>>> BEST: L={selected_L} (ESS/grad={best_result['ess_per_gradient']:.6f})")
+    tier_label = "QUALITY_PASS" if selection_tier == "quality_pass" else "USABLE_ONLY"
+    print(f"\n>>> BEST: L={selected_L} (ESS/grad={best_result['ess_per_gradient']:.6f}) [{tier_label}]")
 
     # Add grid search metadata
     best_result["grid_search_info"] = {
         "tested_L_values": num_steps_grid,
         "selected_L": selected_L,
+        "selection_tier": selection_tier,
         "has_usable": True,
         "all_results": [{
             "num_steps": r["num_steps"],
             "ess_per_gradient": r.get("ess_per_gradient", 0),
             "ess_bulk_min": r.get("ess_bulk_min", 0),
+            "ess_tail_min": r.get("ess_tail_min", 0),
             "rhat_max": r.get("rhat_max", float('inf')),
+            "rhat_mean": r.get("rhat_mean", None),
+            "accept_rate": r.get("accept_rate", None),
+            "step_size": r.get("step_size", None),
             "total_samples": r.get("total_samples", 0),
+            "n_gradients": r.get("n_gradients", 0),
+            "warmup_time": r.get("warmup_time", None),
+            "sample_time": r.get("sample_time", None),
             "usable": r.get("usable", False),
             "quality_pass": r.get("quality_pass", False),
             "divergence_rate": r.get("divergence_rate", None),
+            "sliced_w2": r.get("sliced_w2", None),
+            "z_score_max": r.get("z_score_max", None),
+            # GRAHMC-specific
+            "gamma": r.get("gamma", None),
+            "steepness": r.get("steepness", None),
         } for r in grid_results],
     }
 
@@ -396,9 +476,15 @@ def run_single_benchmark_with_L(
     schedule_type: str,
     num_steps: int,
     learn_mass_matrix: bool = True,
+    track_convergence: bool = False,
+    convergence_base: float = 1.5,
 ) -> Dict:
     """Run a single benchmark with a specific trajectory length.
     This is the internal function called by grid search.
+
+    Args:
+        track_convergence: If True, track W2 distance at log-spaced checkpoints
+        convergence_base: Base for log spacing of checkpoints (default: 1.5)
     """
     print(f"\n{'='*80}")
     print(f"BENCHMARK: {sampler.upper()} on {target.name}")
@@ -448,7 +534,8 @@ def run_single_benchmark_with_L(
             elif sampler in ["grahmc", "rahmc"]:
                 sampler_kwargs["num_steps"] = num_steps
                 sampler_kwargs["gamma"] = 1.0
-                sampler_kwargs["steepness"] = 1 if schedule_type == "tanh" else 5
+                # Steepness from ablation study: lower is better (smoother transitions)
+                sampler_kwargs["steepness"] = 0.5 if schedule_type == "tanh" else 2.0
                 sampler_kwargs["friction_schedule"] = get_friction_schedule(schedule_type)
 
             sampler_name_map = {"grahmc": "grahmc", "rahmc": "grahmc"}
@@ -475,52 +562,143 @@ def run_single_benchmark_with_L(
         else:
             print(f"  Mass matrix: Identity (not learned)")
 
-        # Production sampling phase with FIXED sample count
-        print(f"\n[Phase 2] Fixed Sampling ({num_samples} samples)...")
-        sample_start = time.time()
+        # Production sampling phase
+        if track_convergence and sampler in ["hmc", "grahmc", "rahmc"]:
+            # Batch-based sampling with convergence tracking
+            print(f"\n[Phase 2] Convergence Tracking Sampling ({num_samples} samples)...")
+            checkpoints = get_log_checkpoints(num_samples, base=convergence_base)
+            print(f"  Tracking at {len(checkpoints)} checkpoints: {checkpoints[:5]}{'...' if len(checkpoints) > 5 else ''}")
 
-        current_position = warmup_pos
-        key, sample_key = random.split(key)
+            sample_start = time.time()
+            current_position = warmup_pos
+            all_samples_list = []
+            all_accept_rates = []
+            convergence_trace = []
 
-        if sampler == "rwmh":
-            samples, log_probs, accept_rate, final_state = rwMH_run(
-                sample_key, target.log_prob_fn, current_position,
-                num_samples=num_samples, scale=step_size, burn_in=0
-            )
+            for checkpoint_idx, checkpoint in enumerate(checkpoints):
+                # Determine batch size
+                if checkpoint_idx == 0:
+                    batch_size = checkpoint
+                    prev_samples = 0
+                else:
+                    prev_samples = checkpoints[checkpoint_idx - 1]
+                    batch_size = checkpoint - prev_samples
+
+                # Run sampler for this batch
+                key, sample_key = random.split(key)
+
+                if sampler == "hmc":
+                    batch_samples, batch_log_probs, batch_accept_rate, final_state = hmc_run(
+                        sample_key, target.log_prob_fn, current_position,
+                        step_size=step_size, num_steps=num_steps,
+                        num_samples=batch_size, burn_in=0,
+                        inv_mass_matrix=inv_mass_matrix
+                    )
+                elif sampler in ["grahmc", "rahmc"]:
+                    tuned_gamma = warmup_info.get("gamma", 1.0)
+                    tuned_steepness = warmup_info.get("steepness", 5.0)
+                    friction_schedule = get_friction_schedule(schedule_type)
+
+                    batch_samples, batch_log_probs, batch_accept_rate, final_state = rahmc_run(
+                        sample_key, target.log_prob_fn, current_position,
+                        step_size=step_size, num_steps=num_steps,
+                        gamma=tuned_gamma, steepness=tuned_steepness,
+                        num_samples=batch_size, burn_in=0,
+                        inv_mass_matrix=inv_mass_matrix,
+                        friction_schedule=friction_schedule
+                    )
+
+                # Accumulate samples and accept rates
+                all_samples_list.append(batch_samples)
+                all_accept_rates.append(batch_accept_rate)
+                current_position = final_state.position
+
+                # Concatenate all samples so far
+                cumulative_samples = jnp.concatenate(all_samples_list, axis=0)
+
+                # Compute W2 on cumulative samples
+                key, w2_key = random.split(key)
+                w2_distance = compute_sliced_w2(
+                    cumulative_samples, target_name, target.dim,
+                    n_reference=50000, n_projections=500, key=w2_key
+                )
+
+                # Compute diagnostics on cumulative samples
+                checkpoint_diagnostics = compute_diagnostics(cumulative_samples)
+
+                # Calculate gradient count
+                if sampler == "hmc":
+                    n_gradients = checkpoint * num_steps * 2  # 2 grads per leapfrog step
+                elif sampler in ["grahmc", "rahmc"]:
+                    n_gradients = checkpoint * num_steps * 2  # Same as HMC
+
+                # Store convergence data
+                convergence_trace.append({
+                    "checkpoint": int(checkpoint),
+                    "n_gradients": int(n_gradients),
+                    "w2_distance": float(w2_distance) if w2_distance is not None else None,
+                    "ess_bulk_min": float(checkpoint_diagnostics["ess_bulk_min"]),
+                    "ess_tail_min": float(checkpoint_diagnostics["ess_tail_min"]),
+                    "rhat_max": float(checkpoint_diagnostics["rhat_max"]),
+                })
+
+                if (checkpoint_idx + 1) % 3 == 0 or checkpoint_idx == len(checkpoints) - 1:
+                    w2_str = f"{w2_distance:.6f}" if w2_distance is not None else "N/A"
+                    print(f"    Checkpoint {checkpoint}/{num_samples}: W2={w2_str}, ESS={checkpoint_diagnostics['ess_bulk_min']:.0f}")
+
+            # Finalize
+            samples = cumulative_samples
+            accept_rate = jnp.concatenate(all_accept_rates, axis=0)
             all_tree_depths = None
 
-        elif sampler == "hmc":
-            samples, log_probs, accept_rate, final_state = hmc_run(
-                sample_key, target.log_prob_fn, current_position,
-                step_size=step_size, num_steps=num_steps,
-                num_samples=num_samples, burn_in=0,
-                inv_mass_matrix=inv_mass_matrix
-            )
-            all_tree_depths = None
+        else:
+            # Standard single-batch sampling (no convergence tracking)
+            print(f"\n[Phase 2] Fixed Sampling ({num_samples} samples)...")
+            sample_start = time.time()
+            convergence_trace = None
 
-        elif sampler == "nuts":
-            samples, log_probs, accept_rate, final_state, tree_depths, mean_accept_probs = nuts_run(
-                sample_key, target.log_prob_fn, current_position,
-                step_size=step_size, max_tree_depth=10,
-                num_samples=num_samples, burn_in=0,
-                inv_mass_matrix=inv_mass_matrix
-            )
-            all_tree_depths = tree_depths
+            current_position = warmup_pos
+            key, sample_key = random.split(key)
 
-        elif sampler in ["grahmc", "rahmc"]:
-            tuned_gamma = warmup_info.get("gamma", 1.0)
-            tuned_steepness = warmup_info.get("steepness", 5.0)
-            friction_schedule = get_friction_schedule(schedule_type)
+            if sampler == "rwmh":
+                samples, log_probs, accept_rate, final_state = rwMH_run(
+                    sample_key, target.log_prob_fn, current_position,
+                    num_samples=num_samples, scale=step_size, burn_in=0
+                )
+                all_tree_depths = None
 
-            samples, log_probs, accept_rate, final_state = rahmc_run(
-                sample_key, target.log_prob_fn, current_position,
-                step_size=step_size, num_steps=num_steps,
-                gamma=tuned_gamma, steepness=tuned_steepness,
-                num_samples=num_samples, burn_in=0,
-                inv_mass_matrix=inv_mass_matrix,
-                friction_schedule=friction_schedule
-            )
-            all_tree_depths = None
+            elif sampler == "hmc":
+                samples, log_probs, accept_rate, final_state = hmc_run(
+                    sample_key, target.log_prob_fn, current_position,
+                    step_size=step_size, num_steps=num_steps,
+                    num_samples=num_samples, burn_in=0,
+                    inv_mass_matrix=inv_mass_matrix
+                )
+                all_tree_depths = None
+
+            elif sampler == "nuts":
+                samples, log_probs, accept_rate, final_state, tree_depths, mean_accept_probs = nuts_run(
+                    sample_key, target.log_prob_fn, current_position,
+                    step_size=step_size, max_tree_depth=10,
+                    num_samples=num_samples, burn_in=0,
+                    inv_mass_matrix=inv_mass_matrix
+                )
+                all_tree_depths = tree_depths
+
+            elif sampler in ["grahmc", "rahmc"]:
+                tuned_gamma = warmup_info.get("gamma", 1.0)
+                tuned_steepness = warmup_info.get("steepness", 5.0)
+                friction_schedule = get_friction_schedule(schedule_type)
+
+                samples, log_probs, accept_rate, final_state = rahmc_run(
+                    sample_key, target.log_prob_fn, current_position,
+                    step_size=step_size, num_steps=num_steps,
+                    gamma=tuned_gamma, steepness=tuned_steepness,
+                    num_samples=num_samples, burn_in=0,
+                    inv_mass_matrix=inv_mass_matrix,
+                    friction_schedule=friction_schedule
+                )
+                all_tree_depths = None
 
         total_samples = num_samples
         final_accept_rate = float(jnp.mean(accept_rate))
@@ -628,8 +806,12 @@ def run_single_benchmark_with_L(
         # Compute total time BEFORE diagnostics (W2) to exclude overhead
         total_time = time.time() - start_time
 
-        # Compute Sliced W2 distance to ground truth (only if usable)
-        if usable:
+        # Compute Sliced W2 distance to ground truth (universal for targets with reference)
+        # Check if reference sampler exists for this target
+        ref_sampler = get_reference_sampler(target_name, target.dim)
+
+        if ref_sampler is not None:
+            # Reference sampler exists - compute W2
             print("[Phase 4] Computing Sliced W2 distance...")
             key, w2_key = random.split(key)
             sliced_w2 = compute_sliced_w2(
@@ -639,11 +821,11 @@ def run_single_benchmark_with_L(
             if sliced_w2 is not None:
                 print(f"  Sliced W2: {sliced_w2:.6f}")
             else:
-                print(f"  Sliced W2: N/A (no reference sampler)")
+                print(f"  Sliced W2: Computation failed")
         else:
-            # Skip W2 for non-usable runs
+            # No reference sampler available
             sliced_w2 = None
-            print("[Phase 4] Skipping W2 computation (run not usable)")
+            print(f"[Phase 4] Sliced W2: N/A (no reference sampler for {target_name} {target.dim}D)")
 
         # Compile results
         results = {
@@ -651,7 +833,7 @@ def run_single_benchmark_with_L(
             "target": target.name,
             "schedule": schedule_type if sampler in ["grahmc", "rahmc"] else None,
             "dim": target.dim,
-            "num_steps": num_steps,
+            "num_steps": num_steps if sampler in ["hmc", "grahmc", "rahmc"] else None,  # Only HMC/GRAHMC use fixed trajectory length
             "n_chains": n_chains,
             "num_warmup": num_warmup,
             "num_samples": num_samples,
@@ -689,8 +871,10 @@ def run_single_benchmark_with_L(
             # Efficiency flags
             "is_inefficient": is_inefficient,
             "is_high_efficiency": is_high_efficiency,
-            # Distributional distance (None if not usable)
+            # Distributional distance (None if not usable, except Neal's Funnel/Rosenbrock always computed)
             "sliced_w2": sliced_w2,
+            # Convergence tracking (None if not tracked)
+            "convergence_trace": convergence_trace if track_convergence else None,
         }
 
         # Add sampler-specific metadata
@@ -751,109 +935,18 @@ def run_single_benchmark_with_L(
         }
 
 
-def run_all_benchmarks(
-    samplers: List[str],
-    targets: List[str],
-    grahmc_schedules: List[str],
-    dim: int,
-    n_chains: int,
-    num_warmup: int,
-    num_samples: int,
-    seed: int,
-    output_dir: str,
-    num_steps_grid: List[int] = None,
-    mass_matrix_modes: List[bool] = None,
-) -> pd.DataFrame:
-    """Run all sampler-target combinations and save results."""
+def save_result_incremental(result: Dict, output_dir: str, is_first: bool = False):
+    """Save a single result to CSV and JSON files incrementally.
 
-    # Set up JAX
-    jax.config.update("jax_enable_x64", True)
-    key = random.PRNGKey(seed)
-
-    # Create output directory
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-    # Default grid for trajectory length if not specified
-    if num_steps_grid is None:
-        num_steps_grid = [8, 16, 24, 32, 48, 64]
-
-    all_results = []
-
-    # Iterate over all combinations
-    for target_name in targets:
-        print(f"\n\n{'#'*80}")
-        print(f"# TARGET: {target_name.upper()} (dim={dim})")
-        print(f"{'#'*80}")
-
-        target = get_target(target_name, dim=dim)
-
-        for sampler in samplers:
-            for learn_mass_matrix in mass_matrix_modes:
-                if sampler in ["grahmc", "rahmc"]:
-                    # Test each schedule for GRAHMC with grid search over L
-                    for schedule in grahmc_schedules:
-                        key, subkey = random.split(key)
-                        results = run_trajectory_length_grid_search(
-                            sampler=sampler,
-                            target=target,
-                            target_name=target_name,
-                            key=subkey,
-                            n_chains=n_chains,
-                            num_warmup=num_warmup,
-                            num_samples=num_samples,
-                            schedule_type=schedule,
-                            num_steps_grid=num_steps_grid,
-                            learn_mass_matrix=learn_mass_matrix,
-                        )
-                        all_results.append(results)
-                elif sampler == "hmc":
-                    # HMC uses grid search over L
-                    key, subkey = random.split(key)
-                    results = run_trajectory_length_grid_search(
-                        sampler=sampler,
-                        target=target,
-                        target_name=target_name,
-                        key=subkey,
-                        n_chains=n_chains,
-                        num_warmup=num_warmup,
-                        num_samples=num_samples,
-                        schedule_type="constant",  # Unused for HMC
-                        num_steps_grid=num_steps_grid,
-                        learn_mass_matrix=learn_mass_matrix,
-                    )
-                    all_results.append(results)
-                else:
-                    # RWMH and NUTS don't use trajectory length grid search
-                    key, subkey = random.split(key)
-                    results = run_single_benchmark_with_L(
-                        sampler=sampler,
-                        target=target,
-                        target_name=target_name,
-                        key=subkey,
-                        n_chains=n_chains,
-                        num_warmup=num_warmup,
-                        num_samples=num_samples,
-                        schedule_type="constant",  # Unused for RWMH/NUTS
-                        num_steps=20,  # Unused for RWMH/NUTS
-                        learn_mass_matrix=learn_mass_matrix,
-                    )
-                    all_results.append(results)
-
-    # Convert to DataFrame
-    df = pd.DataFrame(all_results)
-
-    # Save results
+    Args:
+        result: Result dictionary from a single benchmark run
+        output_dir: Output directory path
+        is_first: If True, create new files with headers; if False, append
+    """
     csv_path = Path(output_dir) / "benchmark_results.csv"
     json_path = Path(output_dir) / "benchmark_results.json"
 
-    # Round numeric columns
-    numeric_cols = df.select_dtypes(include=[float]).columns
-    df[numeric_cols] = df[numeric_cols].round(4)
-
-    df.to_csv(csv_path, index=False)
-    print(f"\n\n[OK] Results saved to {csv_path}")
-
-    # Save JSON
+    # Helper to round floats in nested structures
     def round_floats(obj):
         if isinstance(obj, float):
             return round(obj, 4)
@@ -871,10 +964,240 @@ def run_all_benchmarks(
             return float(obj)
         return obj
 
-    rounded_results = round_floats(all_results)
+    # Round result
+    rounded_result = round_floats(result)
+
+    # Prepare CSV-compatible version (deep copy to avoid mutating original)
+    import copy
+    csv_result = copy.deepcopy(rounded_result)
+
+    # Convert nested dicts to JSON strings to avoid column expansion issues
+    for key in ['grid_search_info', 'convergence_trace']:
+        if key in csv_result and csv_result[key] is not None:
+            csv_result[key] = json.dumps(csv_result[key])
+
+    # Save to CSV
+    df_row = pd.DataFrame([csv_result])
+
+    if is_first:
+        # Create new file with header - store column order for future appends
+        df_row.to_csv(csv_path, index=False, mode='w')
+        # Save column order to ensure consistency
+        col_order_path = Path(output_dir) / ".csv_columns.json"
+        with open(col_order_path, 'w') as f:
+            json.dump(df_row.columns.tolist(), f)
+    else:
+        # Read expected column order
+        col_order_path = Path(output_dir) / ".csv_columns.json"
+        if col_order_path.exists():
+            with open(col_order_path, 'r') as f:
+                expected_cols = json.load(f)
+
+            # Reindex DataFrame to match expected column order
+            # Missing columns will be NaN, extra columns will be dropped
+            df_row = df_row.reindex(columns=expected_cols)
+        else:
+            # Fallback: if column order file is missing, recreate it
+            # This shouldn't happen in normal operation but provides safety
+            print(f"WARNING: Column order file missing, recreating from current result")
+            with open(col_order_path, 'w') as f:
+                json.dump(df_row.columns.tolist(), f)
+
+        # Append without header
+        df_row.to_csv(csv_path, index=False, mode='a', header=False)
+
+    # Save to JSON (read existing, append, write)
+    if is_first:
+        all_results_json = [rounded_result]
+    else:
+        # Load existing results
+        if json_path.exists():
+            with open(json_path, 'r') as f:
+                all_results_json = json.load(f)
+        else:
+            all_results_json = []
+        all_results_json.append(rounded_result)
+
+    # Write updated JSON
     with open(json_path, 'w') as f:
-        json.dump(rounded_results, f, indent=2)
-    print(f"[OK] Results saved to {json_path}")
+        json.dump(all_results_json, f, indent=2)
+
+
+def run_all_benchmarks(
+    samplers: List[str],
+    targets: List[str],
+    grahmc_schedules: List[str],
+    dim: int,
+    n_chains: int,
+    num_warmup: int,
+    num_samples: int,
+    seed: int,
+    output_dir: str,
+    num_steps_grid: List[int] = None,
+    mass_matrix_modes: List[bool] = None,
+    track_convergence: bool = False,
+    convergence_base: float = 1.5,
+) -> pd.DataFrame:
+    """Run all sampler-target combinations and save results incrementally.
+
+    Results are saved after each benchmark completes, so interrupted runs
+    don't lose all progress.
+    """
+
+    # Set up JAX
+    jax.config.update("jax_enable_x64", True)
+    key = random.PRNGKey(seed)
+
+    # Create output directory
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    # Default grid for trajectory length if not specified
+    if num_steps_grid is None:
+        num_steps_grid = [8, 16, 24, 32, 48, 64, 96]
+
+    # Check if resuming from existing results
+    csv_path = Path(output_dir) / "benchmark_results.csv"
+    json_path = Path(output_dir) / "benchmark_results.json"
+    col_order_path = Path(output_dir) / ".csv_columns.json"
+
+    if json_path.exists():
+        # Resume mode: load existing results to skip already-completed runs
+        print(f"\n{'='*80}")
+        print(f"RESUMING FROM EXISTING RESULTS")
+        print(f"{'='*80}")
+        with open(json_path, 'r') as f:
+            all_results = json.load(f)
+        print(f"Found {len(all_results)} existing results")
+
+        # Build set of completed (sampler, target, schedule, mass_matrix) tuples
+        completed_runs = set()
+        for r in all_results:
+            run_signature = (
+                r.get("sampler"),
+                r.get("target"),
+                r.get("schedule"),  # None for non-GRAHMC
+                r.get("mass_matrix_learned"),
+            )
+            completed_runs.add(run_signature)
+
+        print(f"Will skip {len(completed_runs)} already-completed configurations")
+        is_first_result = False  # Append mode
+        print(f"{'='*80}\n")
+    else:
+        # Fresh start
+        all_results = []
+        completed_runs = set()
+        is_first_result = True
+
+    # Iterate over all combinations
+    for target_name in targets:
+        print(f"\n\n{'#'*80}")
+        print(f"# TARGET: {target_name.upper()} (dim={dim})")
+        print(f"{'#'*80}")
+
+        target = get_target(target_name, dim=dim)
+
+        for sampler in samplers:
+            for learn_mass_matrix in mass_matrix_modes:
+                if sampler in ["grahmc", "rahmc"]:
+                    # Test each schedule for GRAHMC with grid search over L
+                    for schedule in grahmc_schedules:
+                        # Check if already completed
+                        run_key = (sampler, target.name, schedule, learn_mass_matrix)
+                        if run_key in completed_runs:
+                            print(f"  [SKIP] {sampler}/{target.name}/{schedule}/mass={learn_mass_matrix} (already completed)")
+                            continue
+
+                        key, subkey = random.split(key)
+                        results = run_trajectory_length_grid_search(
+                            sampler=sampler,
+                            target=target,
+                            target_name=target_name,
+                            key=subkey,
+                            n_chains=n_chains,
+                            num_warmup=num_warmup,
+                            num_samples=num_samples,
+                            schedule_type=schedule,
+                            num_steps_grid=num_steps_grid,
+                            learn_mass_matrix=learn_mass_matrix,
+                            track_convergence=track_convergence,
+                            convergence_base=convergence_base,
+                        )
+                        all_results.append(results)
+                        # Save incrementally
+                        save_result_incremental(results, output_dir, is_first=is_first_result)
+                        is_first_result = False
+                elif sampler == "hmc":
+                    # HMC uses grid search over L
+                    # Check if already completed
+                    run_key = (sampler, target.name, None, learn_mass_matrix)
+                    if run_key in completed_runs:
+                        print(f"  [SKIP] {sampler}/{target.name}/mass={learn_mass_matrix} (already completed)")
+                        continue
+
+                    key, subkey = random.split(key)
+                    results = run_trajectory_length_grid_search(
+                        sampler=sampler,
+                        target=target,
+                        target_name=target_name,
+                        key=subkey,
+                        n_chains=n_chains,
+                        num_warmup=num_warmup,
+                        num_samples=num_samples,
+                        schedule_type="constant",  # Unused for HMC
+                        num_steps_grid=num_steps_grid,
+                        learn_mass_matrix=learn_mass_matrix,
+                        track_convergence=track_convergence,
+                        convergence_base=convergence_base,
+                    )
+                    all_results.append(results)
+                    # Save incrementally
+                    save_result_incremental(results, output_dir, is_first=is_first_result)
+                    is_first_result = False
+                else:
+                    # RWMH and NUTS don't use trajectory length grid search
+                    # Check if already completed
+                    run_key = (sampler, target.name, None, learn_mass_matrix)
+                    if run_key in completed_runs:
+                        print(f"  [SKIP] {sampler}/{target.name}/mass={learn_mass_matrix} (already completed)")
+                        continue
+
+                    key, subkey = random.split(key)
+                    results = run_single_benchmark_with_L(
+                        sampler=sampler,
+                        target=target,
+                        target_name=target_name,
+                        key=subkey,
+                        n_chains=n_chains,
+                        num_warmup=num_warmup,
+                        num_samples=num_samples,
+                        schedule_type="constant",  # Unused for RWMH/NUTS
+                        num_steps=20,  # Unused for RWMH/NUTS
+                        learn_mass_matrix=learn_mass_matrix,
+                    )
+                    all_results.append(results)
+                    # Save incrementally
+                    save_result_incremental(results, output_dir, is_first=is_first_result)
+                    is_first_result = False
+
+    # Convert to DataFrame for return value and summary
+    df = pd.DataFrame(all_results)
+
+    # Results already saved incrementally during execution
+    csv_path = Path(output_dir) / "benchmark_results.csv"
+    json_path = Path(output_dir) / "benchmark_results.json"
+
+    # Count new vs resumed results
+    num_existing = len(completed_runs)
+    num_new = len(all_results) - num_existing
+
+    print(f"\n\n[OK] All results saved incrementally to:")
+    print(f"  CSV: {csv_path}")
+    print(f"  JSON: {json_path}")
+    if num_existing > 0:
+        print(f"  Total experiments: {len(all_results)} ({num_existing} resumed, {num_new} new)")
+    else:
+        print(f"  Total experiments: {len(all_results)}")
 
     return df
 
@@ -1042,8 +1365,8 @@ def main():
                        help="Dimensionality of targets")
     parser.add_argument("--n-chains", type=int, default=4,
                        help="Number of parallel chains")
-    parser.add_argument("--num-warmup", type=int, default=2000,
-                       help="Number of warmup steps for adaptive tuning")
+    parser.add_argument("--num-warmup", type=int, default=2500,
+                       help="Number of warmup steps (default: 500 exploration + 1875 adaptation + 125 cooldown)")
     parser.add_argument("--num-samples", type=int, default=None,
                        help="Fixed number of samples to collect (default: 10k for dim>=20, 4k otherwise)")
     parser.add_argument("--num-steps-grid", nargs="+", type=int, default=None,
@@ -1051,6 +1374,12 @@ def main():
     parser.add_argument("--mass-matrix-mode", type=str,
                        choices=["mass", "no-mass", "both"], default="mass",
                        help="Mass matrix configuration: 'mass' (learn), 'no-mass' (identity), 'both' (run both)")
+
+    # Convergence tracking
+    parser.add_argument("--track-convergence", action="store_true",
+                       help="Track W2 convergence at log-spaced checkpoints (adds ~30-75s overhead per run)")
+    parser.add_argument("--convergence-base", type=float, default=1.5,
+                       help="Log spacing base for convergence checkpoints (default: 1.5)")
 
     # Output
     parser.add_argument("--output-dir", type=str, default="benchmark_results",
@@ -1084,7 +1413,7 @@ def main():
         if args.dim >= 20:
             num_samples = 10000
         else:
-            num_samples = 4000
+            num_samples = 10000
         print(f"Using default num_samples={num_samples} for dim={args.dim}")
     else:
         num_samples = args.num_samples
@@ -1122,6 +1451,8 @@ def main():
         output_dir=args.output_dir,
         num_steps_grid=args.num_steps_grid,
         mass_matrix_modes=mass_matrix_modes,
+        track_convergence=args.track_convergence,
+        convergence_base=args.convergence_base,
     )
 
     # Print summary

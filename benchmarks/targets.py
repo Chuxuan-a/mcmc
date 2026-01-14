@@ -644,8 +644,44 @@ def get_reference_sampler(target_name: str, dim: int = 10, **kwargs):
         return sampler
 
     elif target_name == 'rosenbrock':
-        # No direct sampler available for Rosenbrock
-        return None
+        # Load pre-generated samples for 20D or 50D
+        if dim not in [20, 50]:
+            return None
+
+        import os
+        import warnings
+        import numpy as np
+
+        # Build filename based on dimension
+        filename = f'rosenbrock_{dim}d.npy'
+        ref_path = os.path.join(os.path.dirname(__file__), 'reference_samples', filename)
+
+        if not os.path.exists(ref_path):
+            warnings.warn(
+                f"Reference samples not found at {ref_path}. "
+                f"Run 'python generate_rosenbrock_reference.py' to generate them.",
+                UserWarning
+            )
+            return None
+
+        # Load samples once (cached via closure)
+        reference_samples = jnp.array(np.load(ref_path))
+
+        def sampler(key, n):
+            """Randomly subsample n samples from pre-generated reference."""
+            n_available = len(reference_samples)
+            if n > n_available:
+                warnings.warn(
+                    f"Requested {n} samples but only {n_available} available. "
+                    f"Using all {n_available} samples.",
+                    UserWarning
+                )
+                n = n_available
+
+            indices = random.choice(key, n_available, shape=(n,), replace=False)
+            return reference_samples[indices]
+
+        return sampler
 
     else:
         return None
@@ -661,4 +697,5 @@ def has_reference_sampler(target_name: str) -> bool:
         'log_gamma',
         'neals_funnel',
         'gaussian_mixture',
+        'rosenbrock',
     ]
