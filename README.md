@@ -1,15 +1,25 @@
 # MCMC Samplers with Adaptive Friction
 
-A JAX-based research codebase for developing and benchmarking MCMC samplers, with emphasis on Generalized Repelling-Attracting Hamiltonian Monte Carlo (GRAHMC) with various friction schedules.
+A JAX-based research codebase for developing and benchmarking MCMC samplers, with emphasis on Generalized Repelling-Attracting Hamiltonian Monte Carlo (GRAHMC) featuring time-varying friction schedules.
+
+<p align="center">
+  <img src="animations/sampler_comparison.gif" alt="RAHMC vs HMC comparison" width="500">
+</p>
+
+<p align="center">
+  <em>RAHMC escapes local modes through repelling-attracting dynamics, while standard HMC remains trapped.</em>
+</p>
 
 ## Features
 
 - **Multiple MCMC Samplers**: Random Walk Metropolis-Hastings (RWMH), Hamiltonian Monte Carlo (HMC), No-U-Turn Sampler (NUTS), and Generalized RAHMC (GRAHMC)
-- **Friction Schedules**: Five different friction schedule functions (constant, tanh, sigmoid, linear, sine) for time-varying friction dynamics
-- **Automated Parameter Tuning**: Dual averaging (Hoffman & Gelman 2014) with coordinate-wise optimization for GRAHMC, Stan-style windowed adaptation with mass matrix learning
-- **Diverse Target Distributions**: Standard normal, correlated Gaussian, ill-conditioned Gaussian, Neal's funnel, Student-t, Rosenbrock, and Gaussian mixtures
+- **Five Friction Schedules**: constant, tanh, sigmoid, linear, and sine for time-varying friction dynamics
+- **Fixed-Budget Benchmarking**: Systematic evaluation with fixed sample budgets and convergence tracking
+- **Two-Tier Quality Gates**: Usable (hard gate) vs Quality Pass thresholds for filtering results
+- **Trajectory Length Optimization**: Automatic grid search for optimal L in HMC/GRAHMC
+- **Automated Parameter Tuning**: Dual averaging for step size, windowed mass matrix adaptation, sequential friction tuning
+- **Comprehensive Diagnostics**: ESS (bulk/tail), R-hat, z-score validation, Sliced Wasserstein-2 distance
 - **Parallel Chain Execution**: Efficient batched sampling via JAX's `vmap()`
-- **Comprehensive Diagnostics**: ESS (bulk/tail), R-hat, acceptance rate tracking, z-score validation against known truth
 
 ## Installation
 
@@ -17,7 +27,7 @@ A JAX-based research codebase for developing and benchmarking MCMC samplers, wit
 pip install -r requirements.txt
 ```
 
-**Requirements**: JAX, Optax, ArviZ, NumPy, Matplotlib, Seaborn, Pandas
+**Requirements**: JAX, Optax, ArviZ, NumPy, Matplotlib, Seaborn
 
 **Important**: Enable float64 precision for numerical stability:
 ```python
@@ -35,7 +45,6 @@ import jax.numpy as jnp
 from jax import random
 from samplers.GRAHMC import rahmc_run, get_friction_schedule
 
-# Enable float64 for numerical stability
 jax.config.update("jax_enable_x64", True)
 
 # Define target distribution (10D standard normal)
@@ -53,7 +62,7 @@ samples, log_probs, accept_rate, final_state = rahmc_run(
     step_size=0.05,
     num_steps=16,
     gamma=1.0,
-    steepness=5.0,
+    steepness=0.5,  # default for tanh
     friction_schedule=get_friction_schedule('tanh')
 )
 
@@ -61,26 +70,36 @@ print(f"Acceptance rate: {jnp.mean(accept_rate):.3f}")
 print(f"Samples shape: {samples.shape}")  # (1000, 4, 10)
 ```
 
-### Testing Samplers
-
-```bash
-# Test samplers on various target distributions
-python test_samplers.py --sampler hmc --target standard_normal --dim 10 --chains 4 --target-ess 1000
-python test_samplers.py --sampler nuts --target ill_conditioned_gaussian --dim 10
-python test_samplers.py --sampler grahmc --schedule tanh --target neals_funnel --dim 10
-```
-
 ### Running Benchmarks
 
 ```bash
-# Run comprehensive benchmarks across all sampler-target combinations
-python run_benchmarks.py --output-dir results --dim 10
+# Run benchmarks on specific targets (default: 10D, 4 chains, 2500 warmup)
+python run_benchmarks.py --targets standard_normal rosenbrock
 
-# Quick test mode
-python run_benchmarks.py --quick
+# Run all targets at 20D
+python run_benchmarks.py --all-targets --dim 20
 
-# Specific samplers and targets
-python run_benchmarks.py --samplers hmc nuts grahmc --targets standard_normal ill_conditioned_gaussian
+# With convergence tracking (logs Sliced W2 at checkpoints)
+python run_benchmarks.py --targets neals_funnel --track-convergence
+
+# Custom trajectory length grid for HMC/GRAHMC
+python run_benchmarks.py --dim 20 --num-steps-grid 16 32 64 128
+
+# Specific samplers and schedules
+python run_benchmarks.py --samplers hmc grahmc --schedules tanh sigmoid
+
+# Without mass matrix learning (identity mass)
+python run_benchmarks.py --mass-matrix-mode no-mass
+```
+
+### Analyzing Results
+
+```bash
+# Generate research plots
+python analyze_benchmarks.py benchmark_results/ --research --output plots/
+
+# Grid search analysis for trajectory lengths
+python analyze_benchmarks.py benchmark_results/ --L-all
 ```
 
 ## Project Structure
@@ -99,10 +118,17 @@ python run_benchmarks.py --samplers hmc nuts grahmc --targets standard_normal il
 │   ├── welford.py              # Online mean/variance estimation
 │   └── plots.py                # Diagnostic visualization
 ├── benchmarks/                  # Benchmarking infrastructure
-│   └── targets.py              # Target distribution definitions
-├── test_samplers.py            # Sampler testing with diagnostics
-├── run_benchmarks.py           # Comprehensive benchmark suite
-└── requirements.txt            # Python dependencies
+│   ├── targets.py              # Target distribution definitions
+│   ├── metrics.py              # Quality metrics and gates
+│   └── rahmc_paper_targets.py  # RAHMC paper comparison targets
+├── analysis/                    # Results analysis utilities
+│   ├── utils.py                # Data loading and processing
+│   ├── grid_analysis.py        # L grid search analysis
+│   └── research_plots.py       # Publication-quality plots
+├── animations/                  # Sampler comparison visualizations
+├── run_benchmarks.py           # Main benchmark runner
+├── analyze_benchmarks.py       # Results analysis CLI
+└── requirements.txt
 ```
 
 ## Samplers
@@ -120,13 +146,13 @@ Automatic trajectory length selection via iterative tree doubling with U-turn de
 Generalized Repelling-Attracting HMC with time-varying friction. The friction coefficient γ(t) transitions from negative (repelling/accelerating) to positive (attracting/damping) during each trajectory.
 
 **Friction Schedules:**
-| Schedule | Formula | Uses Steepness |
-|----------|---------|----------------|
-| `constant` | γ(t) = -γ if t<T/2 else +γ | No |
-| `tanh` | γ(t) = γ_max × tanh(s×(2t/T - 1)) | Yes |
-| `sigmoid` | γ(t) = γ_max × (2/(1+exp(-s×(t/T-0.5))) - 1) | Yes |
-| `linear` | γ(t) = -γ + 2γ×t/T | No |
-| `sine` | γ(t) = γ × sin(π×(t/T - 0.5)) | No |
+| Schedule | Formula | Steepness Default |
+|----------|---------|-------------------|
+| `constant` | γ(t) = -γ if t<T/2 else +γ | N/A |
+| `tanh` | γ(t) = γ_max × tanh(s×(2t/T - 1)) | 0.5 |
+| `sigmoid` | γ(t) = γ_max × (2/(1+exp(-s×(t/T-0.5))) - 1) | 2.0 |
+| `linear` | γ(t) = -γ + 2γ×t/T | N/A |
+| `sine` | γ(t) = γ × sin(π×(t/T - 0.5)) | N/A |
 
 ## Target Distributions
 
@@ -136,34 +162,85 @@ Generalized Repelling-Attracting HMC with time-varying friction. The friction co
 | `correlated_gaussian` | High correlation | Compound symmetry, ρ=0.9 |
 | `ill_conditioned_gaussian` | Step size tuning | Condition number κ=100 |
 | `neals_funnel` | Varying curvature | Hierarchical, exp-varying scale |
-| `student_t` | Heavy tails | df=3, infinite 4th moment |
-| `rosenbrock` | Curved valleys | Non-linear correlations |
+| `student_t` | Heavy tails | df=3, challenges momentum control |
+| `rosenbrock` | Curved valleys | Non-linear correlations, narrow ridge |
+| `log_gamma` | Asymmetry | Heavy tails, positivity constraints |
 | `gaussian_mixture` | Multimodality | Bimodal in first dimension |
+
+Additional RAHMC paper targets available in `benchmarks/rahmc_paper_targets.py` for direct comparison with published results.
+
+## Benchmarking System
+
+### Fixed-Budget Approach
+
+The benchmarking system allocates a fixed sample budget (default: 10,000 samples × 4 chains) and measures performance within that budget:
+
+1. **Adaptive Warmup** (2,500 steps): Step size tuning, mass matrix learning, friction optimization
+2. **Production Sampling**: Fixed budget collection with optional convergence tracking
+3. **Diagnostic Computation**: R-hat, ESS, z-scores, Sliced W2 distance
+
+### Two-Tier Quality Gates
+
+Results are filtered through two quality tiers:
+
+**Usable (Hard Gate)** - Minimum standard for comparison:
+- R-hat < 1.05
+- ESS bulk ≥ 400
+- ESS tail ≥ 100
+- Divergence rate < 5%
+
+**Quality Pass** - Publication-ready standard:
+- R-hat < 1.01
+- ESS bulk ≥ 400
+- ESS tail ≥ 200
+- Divergence rate < 1%
+- Z-score test passes (Bonferroni-corrected)
+
+### Trajectory Length Grid Search
+
+For HMC and GRAHMC, the system tests a grid of trajectory lengths (default: [8, 16, 24, 32, 48, 64, 96]) and selects the optimal L by ESS/gradient efficiency, preferring quality_pass runs over merely usable ones.
+
+### Incremental Save/Resume
+
+Benchmark results are saved incrementally after each configuration, allowing runs to resume from interruptions.
 
 ## Tuning Framework
 
 ### Dual Averaging
-Based on Hoffman & Gelman (2014), automatically adjusts parameters to achieve target acceptance rates:
-- **RWMH**: Tunes proposal scale → 0.234 acceptance
-- **HMC/NUTS**: Tunes step size → 0.65 acceptance
-- **GRAHMC**: Coordinate-wise cycling through step_size, gamma, steepness
+Based on Hoffman & Gelman (2014), automatically adjusts step size to achieve target acceptance rates:
+- **RWMH**: Target 0.234
+- **HMC/NUTS**: Target 0.65
+- **GRAHMC**: Target 0.55
 
-### Windowed Adaptation
-Stan-style three-phase warmup:
-1. **Fast init** (75 steps): Initial step size only
-2. **Slow windows** (doubling: 25, 50, 100...): Learn diagonal mass matrix via Welford's algorithm
-3. **Fast final** (50 steps): Final step size refinement
+### Mass Matrix Adaptation
+Stan-style windowed warmup with Welford's online algorithm:
+1. **Exploration phase** (500 steps): Initial step size tuning
+2. **Adaptation windows** (doubling: 25, 50, 100...): Learn diagonal mass matrix
+3. **Cooldown phase** (125 steps): Final step size refinement
 
-For GRAHMC, friction parameters are tuned **after** mass matrix learning to calibrate on the sphered geometry.
+Shrinkage regularization prevents extreme variance estimates.
+
+### GRAHMC Sequential Tuning
+
+Friction parameters are tuned **sequentially** (not jointly) because they have opposite relationships with acceptance rate:
+
+1. **Phase 1**: Tune step size via dual averaging with conservative γ=0.5
+2. **Phase 2**: Tune gamma via ESJD (Expected Squared Jump Distance) grid search
+3. **Steepness**: Fixed at schedule-specific defaults (0.5 for tanh, 2.0 for sigmoid)
+
+This approach correctly optimizes gamma for exploration quality rather than just acceptance rate.
 
 ## Key Design Principles
 
 - **Position arrays**: Always batched as `(n_chains, n_dim)` for parallel execution
 - **Numerical precision**: Float64 for log probabilities and energy calculations
 - **JIT compilation**: All sampling loops compiled for performance
-- **Adaptive sampling**: Collect samples in batches until target ESS reached
-- **Chain continuity**: Maintains state across batches for proper mixing
+- **Fixed-budget evaluation**: Comparable assessment across samplers
+- **Quality gates**: Two-tier filtering for reliable results
+- **Incremental saving**: Resumable benchmarking runs
 
 ## Citation
 
-If you use this code in your research, please cite the relevant papers on Randomized Adaptive HMC.
+If you use this code in your research, please cite the relevant papers on Repelling-Attracting HMC:
+
+- Vishwanath & Tak (2024) - [Repelling-Attracting Hamiltonian Monte Carlo](https://arxiv.org/abs/2403.04607)
