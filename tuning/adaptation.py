@@ -14,47 +14,57 @@ from samplers.NUTS import nuts_init, nuts_run
 from samplers.GRAHMC import rahmc_init, rahmc_run
 
 
-def build_schedule(num_steps: int, initial_buffer: int = 75, final_buffer: int = 50, window_base: int = 25) -> list:
-    """Build a Stan-style windowed schedule.
+def build_schedule(
+    num_steps: int = None,
+    exploration_steps: int = 500,
+    adaptation_windows: list = None,
+    cooldown_steps: int = 125
+) -> list:
+    """Build warmup schedule with exploration, adaptation, and cooldown phases.
 
-    Returns a list of tuples: (start_index, end_index, type)
-    Types: 'fast_init', 'slow', 'fast_final'
+    New warmup structure (based on improved exploration and mass matrix learning):
+    1. Exploration (500 steps): Initial step size tuning, chains converge to typical set
+    2. Adaptation (doubling windows): Mass matrix learning with fixed window sizes
+       Default: [25, 50, 100, 200, 500, 1000] = 1875 steps
+    3. Cooldown (125 steps): Final step size refinement
+
+    Total default warmup: 500 + 1875 + 125 = 2500 steps
+
+    Args:
+        num_steps: Total warmup steps (if None, computed from phases).
+                   If provided and doesn't match computed total, a warning is shown.
+        exploration_steps: Fixed exploration phase duration (default: 500)
+        adaptation_windows: List of window sizes for adaptation phase
+                           (default: [25, 50, 100, 200, 500, 1000])
+        cooldown_steps: Fixed cooldown phase duration (default: 125)
+
+    Returns:
+        List of tuples: (start_index, end_index, phase_type)
+        Phase types: 'exploration', 'adaptation', 'cooldown'
     """
+    if adaptation_windows is None:
+        adaptation_windows = [25, 50, 100, 200, 500, 1000]
+
     schedule = []
     start = 0
 
-    # 1. Initial fast interval
-    if num_steps < initial_buffer + final_buffer + window_base:
-        # Fallback for very short runs
-        return [(0, num_steps, 'fast_init')]
+    # Phase 1: Exploration (fixed duration)
+    schedule.append((start, start + exploration_steps, 'exploration'))
+    start += exploration_steps
 
-    schedule.append((start, start + initial_buffer, 'fast_init'))
-    start += initial_buffer
-
-    # 2. Windowed slow intervals (doubling size)
-    # Remaining space for windows
-    available = num_steps - start - final_buffer
-    window_size = window_base
-
-    while available >= 2 * window_size: # While we can fit a window
-        schedule.append((start, start + window_size, 'slow'))
+    # Phase 2: Adaptation (doubling windows with fixed sizes)
+    for window_size in adaptation_windows:
+        schedule.append((start, start + window_size, 'adaptation'))
         start += window_size
-        available -= window_size
-        window_size *= 2 # Double the window
 
-    # If there is leftover space in 'slow' region, extend the last window
-    if available > 0 and len(schedule) > 1 and schedule[-1][2] == 'slow':
-        prev_start, _, _ = schedule.pop()
-        # Add the remaining available time to this window
-        schedule.append((prev_start, start + available, 'slow'))
-        start += available
-    elif available > 0:
-        # Create one last slow window if we couldn't merge
-        schedule.append((start, start + available, 'slow'))
-        start += available
+    # Phase 3: Cooldown (fixed duration)
+    schedule.append((start, start + cooldown_steps, 'cooldown'))
+    start += cooldown_steps
 
-    # 3. Final fast interval
-    schedule.append((start, num_steps, 'fast_final'))
+    # If num_steps is provided and doesn't match, warn
+    if num_steps is not None and start != num_steps:
+        print(f"Warning: Computed warmup ({start}) doesn't match num_steps ({num_steps})")
+        print(f"  Using computed warmup of {start} steps")
 
     return schedule
 
@@ -114,7 +124,7 @@ def run_adaptive_warmup(
     if sampler in ["grahmc", "rahmc"]:
         # Use conservative defaults for initial tuning
         gamma = 1.0
-        steepness = 1.0 if schedule_type == "tanh" else 5.0
+        steepness = 0.5 if schedule_type == "tanh" else 2.0
     else:
         gamma = None
         steepness = None
@@ -144,10 +154,10 @@ def run_adaptive_warmup(
     for start_idx, end_idx, phase in schedule:
         window_len = end_idx - start_idx
 
-        # Reset Welford at the start of a 'slow' window (only if learning mass matrix)
+        # Reset Welford at the start of an 'adaptation' window (only if learning mass matrix)
         # Maintain separate Welford state for each chain
         # Stan's approach - treats each chain as a separate sequence
-        if phase == 'slow' and learn_mass_matrix:
+        if phase == 'adaptation' and learn_mass_matrix:
             welford_states_per_chain = [welford_init(n_dim) for _ in range(n_chains)]
 
         # OPTIMIZATION: Run sampler in batches instead of 1 step at a time
@@ -208,8 +218,8 @@ def run_adaptive_warmup(
             avg_accept = float(jnp.mean(accept_rate))
             da_state = da_update(da_state, avg_accept, target_accept)
 
-            # Update Welford (Mass Matrix) if in slow phase and learning mass matrix
-            if phase == 'slow' and learn_mass_matrix and sampler in ["hmc", "nuts", "grahmc", "rahmc"]:
+            # Update Welford (Mass Matrix) if in adaptation phase and learning mass matrix
+            if phase == 'adaptation' and learn_mass_matrix and sampler in ["hmc", "nuts", "grahmc", "rahmc"]:
                 # Accumulate all samples from this batch
                 # samples_batch shape: (num_samples, n_chains, n_dim)
                 #
@@ -225,7 +235,7 @@ def run_adaptive_warmup(
                         )
 
         # End of Window Actions
-        if phase == 'slow':
+        if phase == 'adaptation':
             if learn_mass_matrix:
                 # 1. Estimate Variance (Stan's approach: compute per-chain, then average)
                 # BUG FIX (Option B): Average variances across chains to properly handle correlation
@@ -283,7 +293,8 @@ def run_adaptive_warmup(
             schedule_type=schedule_type or "constant",
             target_accept=target_accept,
             max_iter_step=1000,  # Warmup iterations per gamma
-            inv_mass_matrix=inv_mass_matrix,  # ← CRITICAL: Pass learned mass matrix
+            inv_mass_matrix=inv_mass_matrix,  # Pass learned mass matrix
+            init_step_size=final_step_size,  # Pass Phase 2 step size as starting point
             gamma_coarse_values=None,  # Use default [0.01, 0.1, 0.5, 1.0, 2.0, 5.0]
             gamma_samples_per_eval=150,  # Samples for ESJD measurement per gamma
         )
@@ -292,7 +303,7 @@ def run_adaptive_warmup(
         # num_steps = kwargs.get("num_steps", 20)
         
         # Determine fixed steepness based on schedule
-        fixed_steepness = 1.0 if schedule_type == "tanh" else 5.0
+        # fixed_steepness = 0.5 if schedule_type == "tanh" else 2.0
         
         # Run Joint Tuning
         # tuned_step, tuned_gamma, tuned_steepness, tune_history = joint_tune_grahmc(
