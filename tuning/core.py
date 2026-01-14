@@ -608,13 +608,13 @@ def tune_and_sample_grahmc_grid(
         warmup_steps: Number of warmup steps for adaptation.
         max_cycles: Maximum coordinate-wise tuning cycles
         schedule_type: Friction schedule ('constant', 'tanh', 'sigmoid', 'linear', 'sine')
-        num_steps_grid: List of num_steps values to try (default: [8, 16, 24, 32, 48, 64])
+        num_steps_grid: List of num_steps values to try (default: [8, 16, 24, 32, 48, 64, 96])
 
     Returns:
         Dictionary containing best configuration, grid results, and comparison data
     """
     if num_steps_grid is None:
-        num_steps_grid = [8, 16, 24, 32, 48, 64]
+        num_steps_grid = [8, 16, 24, 32, 48, 64, 96]
 
     n_dim = target.dim
     log_prob_fn = target.log_prob_fn
@@ -660,7 +660,7 @@ def tune_and_sample_grahmc_grid(
         key, tune_key2 = random.split(key)
         
         # Determine fixed steepness
-        fixed_steepness = 5.0 if schedule_type == 'tanh' else (10.0 if schedule_type == 'sigmoid' else 1.0)
+        fixed_steepness = 0.5 if schedule_type == 'tanh' else (2.0 if schedule_type == 'sigmoid' else 1.0)
 
         step_size, gamma, steepness, tune_history = joint_tune_grahmc(
             key=tune_key2,
@@ -949,7 +949,7 @@ def main():
     elif args.sampler == "grahmc":
         # Parse num_steps grid (default for GRAHMC)
         if args.num_steps_grid is None:
-            num_steps_grid = [8, 16, 24, 32, 48, 64]
+            num_steps_grid = [8, 16, 24, 32, 48, 64, 96]
         else:
             num_steps_grid = [int(x) for x in args.num_steps_grid.split(',')]
         results = tune_and_sample_grahmc_grid(

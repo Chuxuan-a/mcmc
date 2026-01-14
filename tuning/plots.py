@@ -403,3 +403,68 @@ def plot_coordinate_tuning_history(history: Dict, output_file: str = None):
     else:
         plt.show()
     plt.close()
+
+
+def plot_w2_convergence(
+    results: list,
+    output_path: str,
+    title: str = "W2 Convergence vs Gradient Evaluations",
+    log_scale: bool = True
+):
+    """Plot W2 distance vs cumulative gradient evaluations for multiple samplers.
+
+    Args:
+        results: List of benchmark result dicts with 'convergence_trace' field
+        output_path: Path to save plot (e.g., 'convergence_plot.png')
+        title: Plot title
+        log_scale: Use log-log scale (recommended for convergence plots)
+    """
+    sns.set_style("whitegrid")
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    colors = plt.cm.tab10(np.linspace(0, 1, 10))
+    color_idx = 0
+
+    for result in results:
+        if result.get("convergence_trace") is None:
+            continue
+
+        trace = result["convergence_trace"]
+        if not trace:
+            continue
+
+        gradients = [pt["n_gradients"] for pt in trace]
+        w2_distances = [pt["w2_distance"] for pt in trace if pt["w2_distance"] is not None]
+
+        if not w2_distances:
+            continue
+
+        # Build label
+        label = f"{result['sampler'].upper()}"
+        if result.get('num_steps'):
+            label += f" L={result['num_steps']}"
+        if result.get('schedule') and result['schedule'] != 'constant':
+            label += f" ({result['schedule']})"
+        if result.get('mass_matrix_learned') is not None:
+            mass_label = "mass" if result['mass_matrix_learned'] else "no-mass"
+            label += f" [{mass_label}]"
+
+        ax.plot(gradients[:len(w2_distances)], w2_distances,
+                marker='o', label=label, linewidth=2, markersize=4,
+                color=colors[color_idx % 10])
+        color_idx += 1
+
+    if log_scale:
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+
+    ax.set_xlabel('Cumulative Gradient Evaluations', fontsize=12, fontweight='bold')
+    ax.set_ylabel('W2 Distance to True Distribution', fontsize=12, fontweight='bold')
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.legend(fontsize=10, framealpha=0.9)
+    ax.grid(True, alpha=0.3, which='both')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"Saved convergence plot to {output_path}")
+    plt.close()

@@ -158,7 +158,18 @@ def _integrate_trajectory(
     lp_init = jax.value_and_grad(log_prob_fn)(q_init)[0]
     lp_init = jnp.asarray(lp_init, dtype=jnp.float64)
 
-    # Use fori_loop for dynamic num_steps, accumulating acceptance probabilities
+    # Accumulate acceptance probabilities for step size adaptation.
+    #
+    # IMPLEMENTATION NOTE: This accumulates alpha = exp(min(0, h0 - h_new)) at each
+    # leapfrog step during trajectory integration. The sum is later divided by the
+    # total number of integration steps to compute mean_accept_prob, which is used
+    # for dual averaging step size tuning.
+    #
+    # The current implementation averages over ALL integration steps in the trajectory, 
+    # not just valid (in-slice) states, which aligns with Stan's implementation.
+    # Filtering by the slice would bias the statistic and break step size adaptation.
+    #
+    # Stan reference: https://github.com/stan-dev/stan/blob/develop/src/stan/mcmc/hmc/nuts/base_nuts.hpp
     def integrate_steps(carry):
         def loop_body(i, carry):
             q, p, lp, grad, sum_alpha = carry

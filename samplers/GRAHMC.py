@@ -14,8 +14,8 @@ The constant schedule corresponds to the original RAHMC algorithm.
 """
 from __future__ import annotations
 from typing import Callable, Dict, Tuple, NamedTuple, Optional
-import numpy as np
-import arviz as az
+# import numpy as np
+# import arviz as az
 import matplotlib.pyplot as plt
 from functools import partial
 
@@ -463,274 +463,274 @@ def rahmc_run(
 # PROPOSAL TRACE + PLOTTING
 # =========================
 
-def rahmc_proposal_trace(
-    key: Array,
-    log_prob_fn: LogProbFn,
-    q0: Array,
-    step_size: float,
-    num_steps: int,
-    gamma_max: float,
-    friction_schedule: FrictionScheduleFn | None = None,
-    resample_p_between_segments: bool = False,
-):
-    """
-    Run ONE raHMC proposal (no MH decision) and record per-substep (q,p,U,K,H).
-    Uses your _conformal_leapfrog_step and friction_schedule (default constant_friction).
-    q0 can be shape (n_dim,) – we trace a single chain for visualization.
-    Returns:
-      Qs, Ps  : (T+1, d)
-      Us, Ks, Hs : (T+1,)
-      split_idx : index where repel -> attract boundary occurs in arrays
-      resample_idx : index where momentum was resampled (or None)
-    """
-    if friction_schedule is None:
-        friction_schedule = constant_schedule
-        gamma_max = 1.0
-        steepness = 1.0
+# def rahmc_proposal_trace(
+#     key: Array,
+#     log_prob_fn: LogProbFn,
+#     q0: Array,
+#     step_size: float,
+#     num_steps: int,
+#     gamma_max: float,
+#     friction_schedule: FrictionScheduleFn | None = None,
+#     resample_p_between_segments: bool = False,
+# ):
+#     """
+#     Run ONE raHMC proposal (no MH decision) and record per-substep (q,p,U,K,H).
+#     Uses your _conformal_leapfrog_step and friction_schedule (default constant_friction).
+#     q0 can be shape (n_dim,) – we trace a single chain for visualization.
+#     Returns:
+#       Qs, Ps  : (T+1, d)
+#       Us, Ks, Hs : (T+1,)
+#       split_idx : index where repel -> attract boundary occurs in arrays
+#       resample_idx : index where momentum was resampled (or None)
+#     """
+#     if friction_schedule is None:
+#         friction_schedule = constant_schedule
+#         gamma_max = 1.0
+#         steepness = 0.5
 
-    steepness_val = steepness if steepness is not None else 5.0
+#     steepness_val = steepness if steepness is not None else 5.0
 
-    q = jnp.atleast_1d(q0).astype(jnp.float32)
-    d = q.shape[-1]
-    key, k_p1, k_p2 = random.split(key, 3)
+#     q = jnp.atleast_1d(q0).astype(jnp.float32)
+#     d = q.shape[-1]
+#     key, k_p1, k_p2 = random.split(key, 3)
 
-    # p ~ N(0,I) in position dtype
-    p = random.normal(k_p1, shape=(d,), dtype=q.dtype)
+#     # p ~ N(0,I) in position dtype
+#     p = random.normal(k_p1, shape=(d,), dtype=q.dtype)
 
-    # initial energies (float64 log prob like your code)
-    lp, glp = jax.value_and_grad(log_prob_fn)(q)
-    lp = lp.astype(jnp.float64)
-    glp = glp.astype(q.dtype)
-    U = -lp
-    K = 0.5 * jnp.sum(p**2).astype(jnp.float64)
-    H = U + K
+#     # initial energies (float64 log prob like your code)
+#     lp, glp = jax.value_and_grad(log_prob_fn)(q)
+#     lp = lp.astype(jnp.float64)
+#     glp = glp.astype(q.dtype)
+#     U = -lp
+#     K = 0.5 * jnp.sum(p**2).astype(jnp.float64)
+#     H = U + K
 
-    Qs = [np.array(q)]; Ps = [np.array(p)]
-    Us = [float(U)]; Ks = [float(K)]; Hs = [float(H)]
+#     Qs = [np.array(q)]; Ps = [np.array(p)]
+#     Us = [float(U)]; Ks = [float(K)]; Hs = [float(H)]
 
-    L1 = int(num_steps // 2)
-    L2 = int(num_steps - L1)
-    total_time = step_size * num_steps
+#     L1 = int(num_steps // 2)
+#     L2 = int(num_steps - L1)
+#     total_time = step_size * num_steps
 
-    # ---- Repelling segment ----
-    for i in range(L1):
-        t_now = i * step_size
-        gamma_t = float(friction_schedule(t_now, total_time, gamma_max, steepness_val))
-        q, p, lp, glp = _conformal_leapfrog_step(
-            q[None, :], p[None, :], step_size, gamma_t,
-            lp[None, ...], glp[None, :],  # batched to match your API
-            log_prob_fn
-        )
-        # un-batch
-        q = q[0]; p = p[0]; lp = lp[0]; glp = glp[0]
-        U = -lp
-        K = 0.5 * jnp.sum(p**2).astype(jnp.float64)
-        H = U + K
-        Qs.append(np.array(q)); Ps.append(np.array(p))
-        Us.append(float(U)); Ks.append(float(K)); Hs.append(float(H))
+#     # ---- Repelling segment ----
+#     for i in range(L1):
+#         t_now = i * step_size
+#         gamma_t = float(friction_schedule(t_now, total_time, gamma_max, steepness_val))
+#         q, p, lp, glp = _conformal_leapfrog_step(
+#             q[None, :], p[None, :], step_size, gamma_t,
+#             lp[None, ...], glp[None, :],  # batched to match your API
+#             log_prob_fn
+#         )
+#         # un-batch
+#         q = q[0]; p = p[0]; lp = lp[0]; glp = glp[0]
+#         U = -lp
+#         K = 0.5 * jnp.sum(p**2).astype(jnp.float64)
+#         H = U + K
+#         Qs.append(np.array(q)); Ps.append(np.array(p))
+#         Us.append(float(U)); Ks.append(float(K)); Hs.append(float(H))
 
-    split_idx = len(Qs) - 1
-    resample_idx = None
+#     split_idx = len(Qs) - 1
+#     resample_idx = None
 
-    # optional momentum resample between segments
-    if resample_p_between_segments:
-        resample_idx = len(Qs) - 1
-        p = random.normal(k_p2, shape=(d,), dtype=q.dtype)
-        U = -lp; K = 0.5 * jnp.sum(p**2).astype(jnp.float64); H = U + K
-        Qs.append(np.array(q)); Ps.append(np.array(p))
-        Us.append(float(U)); Ks.append(float(K)); Hs.append(float(H))
+#     # optional momentum resample between segments
+#     if resample_p_between_segments:
+#         resample_idx = len(Qs) - 1
+#         p = random.normal(k_p2, shape=(d,), dtype=q.dtype)
+#         U = -lp; K = 0.5 * jnp.sum(p**2).astype(jnp.float64); H = U + K
+#         Qs.append(np.array(q)); Ps.append(np.array(p))
+#         Us.append(float(U)); Ks.append(float(K)); Hs.append(float(H))
 
-    # ---- Attracting segment ----
-    for j in range(L2):
-        t_now = (L1 + j) * step_size
-        gamma_t = float(friction_schedule(t_now, total_time, gamma_max, steepness_val))
-        q, p, lp, glp = _conformal_leapfrog_step(
-            q[None, :], p[None, :], step_size, gamma_t,
-            lp[None, ...], glp[None, :],
-            log_prob_fn
-        )
-        q = q[0]; p = p[0]; lp = lp[0]; glp = glp[0]
-        U = -lp
-        K = 0.5 * jnp.sum(p**2).astype(jnp.float64)
-        H = U + K
-        Qs.append(np.array(q)); Ps.append(np.array(p))
-        Us.append(float(U)); Ks.append(float(K)); Hs.append(float(H))
+#     # ---- Attracting segment ----
+#     for j in range(L2):
+#         t_now = (L1 + j) * step_size
+#         gamma_t = float(friction_schedule(t_now, total_time, gamma_max, steepness_val))
+#         q, p, lp, glp = _conformal_leapfrog_step(
+#             q[None, :], p[None, :], step_size, gamma_t,
+#             lp[None, ...], glp[None, :],
+#             log_prob_fn
+#         )
+#         q = q[0]; p = p[0]; lp = lp[0]; glp = glp[0]
+#         U = -lp
+#         K = 0.5 * jnp.sum(p**2).astype(jnp.float64)
+#         H = U + K
+#         Qs.append(np.array(q)); Ps.append(np.array(p))
+#         Us.append(float(U)); Ks.append(float(K)); Hs.append(float(H))
 
-    return (
-        np.stack(Qs), np.stack(Ps),
-        np.array(Us), np.array(Ks), np.array(Hs),
-        split_idx, resample_idx
-    )
+#     return (
+#         np.stack(Qs), np.stack(Ps),
+#         np.array(Us), np.array(Ks), np.array(Hs),
+#         split_idx, resample_idx
+#     )
 
-# ---------- Plot helpers (auto limits, shading) ----------
-def _auto_limits(x, pad_ratio=0.10):
-    lo, hi = float(np.min(x)), float(np.max(x))
-    if hi == lo:
-        lo -= 1.0; hi += 1.0
-    pad = (hi - lo) * pad_ratio
-    return lo - pad, hi + pad
+# # ---------- Plot helpers (auto limits, shading) ----------
+# def _auto_limits(x, pad_ratio=0.10):
+#     lo, hi = float(np.min(x)), float(np.max(x))
+#     if hi == lo:
+#         lo -= 1.0; hi += 1.0
+#     pad = (hi - lo) * pad_ratio
+#     return lo - pad, hi + pad
 
-def _shade_segments(ax, split_idx, T, a=0.10):
-    ax.axvspan(0, split_idx, color="tab:orange", alpha=a, lw=0)
-    ax.axvspan(split_idx, T-1, color="tab:blue", alpha=a, lw=0)
+# def _shade_segments(ax, split_idx, T, a=0.10):
+#     ax.axvspan(0, split_idx, color="tab:orange", alpha=a, lw=0)
+#     ax.axvspan(split_idx, T-1, color="tab:blue", alpha=a, lw=0)
 
-# ===================== 1) PHASE-SPACE (1D) =====================
-def plot_phase_space_1d(
-    log_prob_fn: LogProbFn,
-    q0: float,
-    key: Array = random.PRNGKey(0),
-    step_size: float = 0.15,
-    num_steps: int = 48,
-    gamma: float = 1.3,
-    friction_schedule: FrictionScheduleFn | None = None,
-    resample_between: bool = False,
-    title: str = "Phase-space (1D)"
-):
-    if friction_schedule is None:
-        friction_schedule = constant_schedule_default
+# # ===================== 1) PHASE-SPACE (1D) =====================
+# def plot_phase_space_1d(
+#     log_prob_fn: LogProbFn,
+#     q0: float,
+#     key: Array = random.PRNGKey(0),
+#     step_size: float = 0.15,
+#     num_steps: int = 48,
+#     gamma: float = 1.3,
+#     friction_schedule: FrictionScheduleFn | None = None,
+#     resample_between: bool = False,
+#     title: str = "Phase-space (1D)"
+# ):
+#     if friction_schedule is None:
+#         friction_schedule = constant_schedule_default
 
-    Qs, Ps, Us, Ks, Hs, split_idx, res_idx = rahmc_proposal_trace(
-        key, log_prob_fn, jnp.array([q0], dtype=jnp.float32),
-        step_size, num_steps, gamma, friction_schedule,
-        resample_p_between_segments=resample_between
-    )
-    q = Qs[:, 0]; p = Ps[:, 0]; T = len(q)
-    colors = np.array(["tab:orange"] * (split_idx + 1) + ["tab:blue"] * (T - (split_idx + 1)))
-    if res_idx is not None:
-        colors[res_idx] = "0.25"
+#     Qs, Ps, Us, Ks, Hs, split_idx, res_idx = rahmc_proposal_trace(
+#         key, log_prob_fn, jnp.array([q0], dtype=jnp.float32),
+#         step_size, num_steps, gamma, friction_schedule,
+#         resample_p_between_segments=resample_between
+#     )
+#     q = Qs[:, 0]; p = Ps[:, 0]; T = len(q)
+#     colors = np.array(["tab:orange"] * (split_idx + 1) + ["tab:blue"] * (T - (split_idx + 1)))
+#     if res_idx is not None:
+#         colors[res_idx] = "0.25"
 
-    # background H-level sets (local grid around path)
-    qlo, qhi = _auto_limits(q, 0.12)
-    plo, phi = _auto_limits(p, 0.12)
-    qg = np.linspace(qlo, qhi, 180)
-    pg = np.linspace(plo, phi, 180)
-    Q, P = np.meshgrid(qg, pg)
-    v_lp = jax.vmap(lambda z: log_prob_fn(jnp.array([z])))
-    Ugrid = -np.array(v_lp(jnp.array(qg)))
-    Hgrid = Ugrid[None, :] + 0.5 * (P**2)
+#     # background H-level sets (local grid around path)
+#     qlo, qhi = _auto_limits(q, 0.12)
+#     plo, phi = _auto_limits(p, 0.12)
+#     qg = np.linspace(qlo, qhi, 180)
+#     pg = np.linspace(plo, phi, 180)
+#     Q, P = np.meshgrid(qg, pg)
+#     v_lp = jax.vmap(lambda z: log_prob_fn(jnp.array([z])))
+#     Ugrid = -np.array(v_lp(jnp.array(qg)))
+#     Hgrid = Ugrid[None, :] + 0.5 * (P**2)
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4.2))
-    ax1.contour(Q, P, Hgrid, levels=12, colors="0.85", linewidths=0.8)
-    ax1.plot(q, p, lw=1.4, color="0.35")
-    step = max(1, T // 28)
-    ax1.quiver(q[:-step:step], p[:-step:step],
-               q[step::step]-q[:-step:step], p[step::step]-p[:-step:step],
-               angles="xy", scale_units="xy", scale=1.0, color="0.35", width=0.004, alpha=0.7)
-    ax1.scatter(q, p, c=colors, s=20, zorder=3)
-    ax1.scatter([q[0]], [p[0]], c="white", edgecolors="k", s=90, zorder=5, label="start")
-    ax1.scatter([q[-1]], [p[-1]], c="k", s=55, zorder=5, label="end")
-    if res_idx is not None:
-        ax1.scatter([q[res_idx]], [p[res_idx]], c="none", edgecolors="k", s=85, marker="D", label="resample")
-    ax1.set_xlim(qlo, qhi); ax1.set_ylim(plo, phi)
-    ax1.set_xlabel(r"$q$"); ax1.set_ylabel(r"$p$"); ax1.set_title(title)
-    ax1.legend(frameon=False); ax1.grid(alpha=0.2)
+#     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4.2))
+#     ax1.contour(Q, P, Hgrid, levels=12, colors="0.85", linewidths=0.8)
+#     ax1.plot(q, p, lw=1.4, color="0.35")
+#     step = max(1, T // 28)
+#     ax1.quiver(q[:-step:step], p[:-step:step],
+#                q[step::step]-q[:-step:step], p[step::step]-p[:-step:step],
+#                angles="xy", scale_units="xy", scale=1.0, color="0.35", width=0.004, alpha=0.7)
+#     ax1.scatter(q, p, c=colors, s=20, zorder=3)
+#     ax1.scatter([q[0]], [p[0]], c="white", edgecolors="k", s=90, zorder=5, label="start")
+#     ax1.scatter([q[-1]], [p[-1]], c="k", s=55, zorder=5, label="end")
+#     if res_idx is not None:
+#         ax1.scatter([q[res_idx]], [p[res_idx]], c="none", edgecolors="k", s=85, marker="D", label="resample")
+#     ax1.set_xlim(qlo, qhi); ax1.set_ylim(plo, phi)
+#     ax1.set_xlabel(r"$q$"); ax1.set_ylabel(r"$p$"); ax1.set_title(title)
+#     ax1.legend(frameon=False); ax1.grid(alpha=0.2)
 
-    U, K, H = np.array(Us), np.array(Ks), np.array(Hs)
-    H0 = np.min(H)  # offset to compress dynamic range
-    ax2.plot(U - H0, label="U (offset)")
-    ax2.plot(K - H0, label="K (offset)")
-    ax2.plot(H - H0, label="H (offset)")
-    ax2.axvline(split_idx, ls="--", lw=1.0, color="0.3")
-    _shade_segments(ax2, split_idx, T, a=0.10)
-    ax2.set_title("Energies per substep"); ax2.legend(frameon=False); ax2.grid(alpha=0.2)
-    plt.tight_layout(); plt.show()
+#     U, K, H = np.array(Us), np.array(Ks), np.array(Hs)
+#     H0 = np.min(H)  # offset to compress dynamic range
+#     ax2.plot(U - H0, label="U (offset)")
+#     ax2.plot(K - H0, label="K (offset)")
+#     ax2.plot(H - H0, label="H (offset)")
+#     ax2.axvline(split_idx, ls="--", lw=1.0, color="0.3")
+#     _shade_segments(ax2, split_idx, T, a=0.10)
+#     ax2.set_title("Energies per substep"); ax2.legend(frameon=False); ax2.grid(alpha=0.2)
+#     plt.tight_layout(); plt.show()
 
-# ====================== 2) Q-SPACE (2D) ======================
-def _contour_U_2d(ax, log_prob_fn, bounds, n=220):
-    xs = np.linspace(bounds[0], bounds[1], n)
-    ys = np.linspace(bounds[2], bounds[3], n)
-    X, Y = np.meshgrid(xs, ys)
-    grid = np.stack([X, Y], axis=-1).reshape(-1, 2)
-    v_lp2 = jax.vmap(lambda v: log_prob_fn(jnp.array(v)))
-    U = -np.array(v_lp2(jnp.array(grid))).reshape(n, n)
-    cs = ax.contour(X, Y, U, levels=18, linewidths=0.6, colors="0.65", alpha=0.95)
-    return cs
+# # ====================== 2) Q-SPACE (2D) ======================
+# def _contour_U_2d(ax, log_prob_fn, bounds, n=220):
+#     xs = np.linspace(bounds[0], bounds[1], n)
+#     ys = np.linspace(bounds[2], bounds[3], n)
+#     X, Y = np.meshgrid(xs, ys)
+#     grid = np.stack([X, Y], axis=-1).reshape(-1, 2)
+#     v_lp2 = jax.vmap(lambda v: log_prob_fn(jnp.array(v)))
+#     U = -np.array(v_lp2(jnp.array(grid))).reshape(n, n)
+#     cs = ax.contour(X, Y, U, levels=18, linewidths=0.6, colors="0.65", alpha=0.95)
+#     return cs
 
-def plot_q_space_2d(
-    log_prob_fn: LogProbFn,
-    q0: tuple[float, float],
-    key: Array = random.PRNGKey(0),
-    step_size: float = 0.12,
-    num_steps: int = 60,
-    gamma: float = 1.2,
-    friction_schedule: FrictionScheduleFn | None = None,
-    resample_between: bool = False,
-    bounds: tuple[float, float, float, float] | None = None,
-    title: str = "q-space (2D)"
-):
-    if friction_schedule is None:
-        friction_schedule = constant_schedule_default
+# def plot_q_space_2d(
+#     log_prob_fn: LogProbFn,
+#     q0: tuple[float, float],
+#     key: Array = random.PRNGKey(0),
+#     step_size: float = 0.12,
+#     num_steps: int = 60,
+#     gamma: float = 1.2,
+#     friction_schedule: FrictionScheduleFn | None = None,
+#     resample_between: bool = False,
+#     bounds: tuple[float, float, float, float] | None = None,
+#     title: str = "q-space (2D)"
+# ):
+#     if friction_schedule is None:
+#         friction_schedule = constant_schedule_default
 
-    Qs, Ps, Us, Ks, Hs, split_idx, res_idx = rahmc_proposal_trace(
-        key, log_prob_fn, jnp.array(q0, dtype=jnp.float32),
-        step_size, num_steps, gamma, friction_schedule,
-        resample_p_between_segments=resample_between
-    )
-    q1, q2 = Qs[:, 0], Qs[:, 1]
-    if bounds is None:
-        xlo, xhi = _auto_limits(q1, 0.10); ylo, yhi = _auto_limits(q2, 0.10)
-        bounds = (xlo, xhi, ylo, yhi)
+#     Qs, Ps, Us, Ks, Hs, split_idx, res_idx = rahmc_proposal_trace(
+#         key, log_prob_fn, jnp.array(q0, dtype=jnp.float32),
+#         step_size, num_steps, gamma, friction_schedule,
+#         resample_p_between_segments=resample_between
+#     )
+#     q1, q2 = Qs[:, 0], Qs[:, 1]
+#     if bounds is None:
+#         xlo, xhi = _auto_limits(q1, 0.10); ylo, yhi = _auto_limits(q2, 0.10)
+#         bounds = (xlo, xhi, ylo, yhi)
 
-    fig, ax = plt.subplots(1, 1, figsize=(5.4, 5.4))
-    _contour_U_2d(ax, log_prob_fn, bounds=bounds)
+#     fig, ax = plt.subplots(1, 1, figsize=(5.4, 5.4))
+#     _contour_U_2d(ax, log_prob_fn, bounds=bounds)
 
-    colors = np.array(["tab:orange"] * (split_idx + 1) + ["tab:blue"] * (len(q1) - (split_idx + 1)))
-    if res_idx is not None:
-        colors[res_idx] = "0.25"
+#     colors = np.array(["tab:orange"] * (split_idx + 1) + ["tab:blue"] * (len(q1) - (split_idx + 1)))
+#     if res_idx is not None:
+#         colors[res_idx] = "0.25"
 
-    ax.plot(q1, q2, lw=1.7, color="0.35", alpha=0.75)
-    step = max(1, len(q1) // 30)
-    ax.quiver(q1[:-step:step], q2[:-step:step],
-              q1[step::step]-q1[:-step:step], q2[step::step]-q2[:-step:step],
-              angles="xy", scale_units="xy", scale=1.0, width=0.0035, color="0.35", alpha=0.7)
-    ax.scatter(q1, q2, c=colors, s=22, zorder=3)
-    ax.scatter([q1[0]], [q2[0]], c="lime", edgecolors="k", s=90, zorder=5, label="start")
-    ax.scatter([q1[-1]], [q2[-1]], c="red", edgecolors="k", s=55, zorder=5, label="end")
-    if res_idx is not None:
-        ax.scatter([q1[res_idx]], [q2[res_idx]], c="none", edgecolors="k", s=85, marker="D", label="resample")
-    ax.set_xlim(bounds[0], bounds[1]); ax.set_ylim(bounds[2], bounds[3])
-    ax.set_xlabel(r"$q_1$"); ax.set_ylabel(r"$q_2$"); ax.set_title(title)
-    ax.legend(frameon=False, loc="best"); ax.grid(alpha=0.15)
-    plt.tight_layout(); plt.show()
+#     ax.plot(q1, q2, lw=1.7, color="0.35", alpha=0.75)
+#     step = max(1, len(q1) // 30)
+#     ax.quiver(q1[:-step:step], q2[:-step:step],
+#               q1[step::step]-q1[:-step:step], q2[step::step]-q2[:-step:step],
+#               angles="xy", scale_units="xy", scale=1.0, width=0.0035, color="0.35", alpha=0.7)
+#     ax.scatter(q1, q2, c=colors, s=22, zorder=3)
+#     ax.scatter([q1[0]], [q2[0]], c="lime", edgecolors="k", s=90, zorder=5, label="start")
+#     ax.scatter([q1[-1]], [q2[-1]], c="red", edgecolors="k", s=55, zorder=5, label="end")
+#     if res_idx is not None:
+#         ax.scatter([q1[res_idx]], [q2[res_idx]], c="none", edgecolors="k", s=85, marker="D", label="resample")
+#     ax.set_xlim(bounds[0], bounds[1]); ax.set_ylim(bounds[2], bounds[3])
+#     ax.set_xlabel(r"$q_1$"); ax.set_ylabel(r"$q_2$"); ax.set_title(title)
+#     ax.legend(frameon=False, loc="best"); ax.grid(alpha=0.15)
+#     plt.tight_layout(); plt.show()
 
-# ----------------- Tiny example bimodal targets (optional) -----------------
-def lp_1d_bimodal(q, m=2.5, s=0.6):
-    q = jnp.atleast_1d(q); x = q[0]
-    terms = jnp.stack([
-        -0.5*((x - m)/s)**2 - jnp.log(s),
-        -0.5*((x + m)/s)**2 - jnp.log(s),
-    ])
-    return jax.scipy.special.logsumexp(terms + jnp.log(0.5))
+# # ----------------- Tiny example bimodal targets (optional) -----------------
+# def lp_1d_bimodal(q, m=2.5, s=0.6):
+#     q = jnp.atleast_1d(q); x = q[0]
+#     terms = jnp.stack([
+#         -0.5*((x - m)/s)**2 - jnp.log(s),
+#         -0.5*((x + m)/s)**2 - jnp.log(s),
+#     ])
+#     return jax.scipy.special.logsumexp(terms + jnp.log(0.5))
 
-def lp_2d_bimodal(q):
-    q = jnp.atleast_1d(q); x, y = q[0], q[1]
-    def logN(mx, my, sx=0.7, sy=0.7, rho=0.0):
-        inv = 1.0/(1 - rho**2)
-        qf = inv*(((x-mx)/sx)**2 - 2*rho*((x-mx)/sx)*((y-my)/sy) + ((y-my)/sy)**2)
-        return -0.5*qf - jnp.log(sx*sy)
-    c1 = logN(-2.0, -1.2, rho= 0.2)
-    c2 = logN(+2.0, +1.2, rho=-0.2)
-    return jax.scipy.special.logsumexp(jnp.array([c1, c2]) + jnp.log(0.5))
+# def lp_2d_bimodal(q):
+#     q = jnp.atleast_1d(q); x, y = q[0], q[1]
+#     def logN(mx, my, sx=0.7, sy=0.7, rho=0.0):
+#         inv = 1.0/(1 - rho**2)
+#         qf = inv*(((x-mx)/sx)**2 - 2*rho*((x-mx)/sx)*((y-my)/sy) + ((y-my)/sy)**2)
+#         return -0.5*qf - jnp.log(sx*sy)
+#     c1 = logN(-2.0, -1.2, rho= 0.2)
+#     c2 = logN(+2.0, +1.2, rho=-0.2)
+#     return jax.scipy.special.logsumexp(jnp.array([c1, c2]) + jnp.log(0.5))
 
-# ----------------------------- Quick demos ---------------------------------
-if __name__ == "__main__":
-    k = random.PRNGKey(0)
+# # ----------------------------- Quick demos ---------------------------------
+# if __name__ == "__main__":
+#     k = random.PRNGKey(0)
 
-    # 1D phase-space (unimodal & bimodal)
-    plot_phase_space_1d(standard_normal_log_prob, 0.5, k, step_size=0.18, num_steps=48, gamma=1.3,
-                        title="Phase-space (1D unimodal, constant γ)")
-    plot_phase_space_1d(lp_1d_bimodal, -1.2, k, step_size=0.16, num_steps=56, gamma=1.5,
-                        title="Phase-space (1D bimodal, constant γ)")
+#     # 1D phase-space (unimodal & bimodal)
+#     plot_phase_space_1d(standard_normal_log_prob, 0.5, k, step_size=0.18, num_steps=48, gamma=1.3,
+#                         title="Phase-space (1D unimodal, constant γ)")
+#     plot_phase_space_1d(lp_1d_bimodal, -1.2, k, step_size=0.16, num_steps=56, gamma=1.5,
+#                         title="Phase-space (1D bimodal, constant γ)")
 
-    # 2D q-space (unimodal & bimodal)
-    def lp_2d_unimodal(q):
-        # correlated normal example
-        q = jnp.atleast_1d(q); x, y = q[0], q[1]
-        rho = 0.6; inv = 1.0/(1 - rho**2)
-        quad = inv * (x**2 - 2*rho*x*y + y**2)
-        return -0.5 * quad
+#     # 2D q-space (unimodal & bimodal)
+#     def lp_2d_unimodal(q):
+#         # correlated normal example
+#         q = jnp.atleast_1d(q); x, y = q[0], q[1]
+#         rho = 0.6; inv = 1.0/(1 - rho**2)
+#         quad = inv * (x**2 - 2*rho*x*y + y**2)
+#         return -0.5 * quad
 
-    plot_q_space_2d(lp_2d_unimodal, [-2.0, 1.0], k, step_size=0.12, num_steps=60, gamma=1.2,
-                    title="q-space (2D unimodal, constant γ)")
-    plot_q_space_2d(lp_2d_bimodal, [-2.0, -1.0], k, step_size=0.12, num_steps=70, gamma=1.4,
-                    title="q-space (2D bimodal, constant γ)")
+#     plot_q_space_2d(lp_2d_unimodal, [-2.0, 1.0], k, step_size=0.12, num_steps=60, gamma=1.2,
+#                     title="q-space (2D unimodal, constant γ)")
+#     plot_q_space_2d(lp_2d_bimodal, [-2.0, -1.0], k, step_size=0.12, num_steps=70, gamma=1.4,
+#                     title="q-space (2D bimodal, constant γ)")
